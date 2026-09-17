@@ -2574,7 +2574,31 @@
     stato.stampa = null;
   }
 
+  /* Sullo schermo del telefono il foglio, largo quanto la pagina A4, viene
+     ridotto fino a rientrare nella larghezza disponibile. La riduzione vale
+     soltanto per la visualizzazione: in stampa il foglio conserva la misura
+     reale, perché la regola CSS che la applica è limitata allo schermo. */
   function componiAnteprima() {
+    var foglio = el('foglio');
+    if (foglio) foglio.style.setProperty('--zoom-anteprima', '1');
+    componiAnteprimaBase();
+    adattaAnteprimaAlloSchermo();
+  }
+
+  function adattaAnteprimaAlloSchermo() {
+    var foglio = el('foglio'), area = foglio ? foglio.parentNode : null;
+    if (!foglio || !area || el('velo-stampa').hidden) return;
+    foglio.style.setProperty('--zoom-anteprima', '1');
+    var cs = getComputedStyle(area);
+    var disponibile = area.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    var largo = foglio.offsetWidth;
+    var z = largo > disponibile && disponibile > 0 ? disponibile / largo : 1;
+    foglio.style.setProperty('--zoom-anteprima', z.toFixed(4));
+  }
+
+  window.addEventListener('resize', function () { adattaAnteprimaAlloSchermo(); });
+
+  function componiAnteprimaBase() {
     if (!stato.stampa) return;
     var o = stato.stampa.opz;
     o.orientamento = el('st-orientamento').value;
