@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archivio verbali · Consiglio d'Istituto · Liceo Palmeri</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232f5d3f'/%3E%3Cg fill='none' stroke='%23fff' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M16 14h32v36H16z'/%3E%3Cpath d='M24 24h16M24 32h16M24 40h10'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icona-180.png">
+<meta name="theme-color" content="#2f5d3f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Verbali CdI">
+</head>
+<body>
+
+<header class="testata">
+  <div class="testata-riga">
+    <div class="marchio">
+      <div class="marchio-titolo">Archivio dei verbali del Consiglio d'Istituto</div>
+      <div class="marchio-sottotitolo">Liceo Scientifico Statale &ldquo;Nicolò Palmeri&rdquo; &middot; Termini Imerese</div>
+    </div>
+    <div class="azioni-testata">
+      <button id="btn-carica" class="bottone primario" type="button">Carica verbali</button>
+      <button id="btn-aggiorna" class="bottone" type="button">Aggiorna indice</button>
+      <div class="menu-contenitore">
+        <button id="btn-altro" class="bottone solo-icona" type="button" title="Altre azioni" aria-haspopup="true">&#8943;</button>
+        <div id="menu-altro" class="menu" hidden>
+          <button type="button" data-azione="reindicizza">Reindicizza tutto da zero</button>
+          <button type="button" data-azione="cartella">Apri l'archivio su GitHub</button>
+          <button type="button" data-azione="esporta">Esporta l'indice delle delibere (CSV)</button>
+          <button type="button" data-azione="stampa-presenze">Stampa il prospetto delle presenze (PDF)</button>
+          <button type="button" data-azione="raccolta">Apri la raccolta da condividere</button>
+          <button type="button" data-azione="impostazioni">Collegamento a GitHub</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="stato-archivio" class="stato-archivio">Avvio in corso…</div>
+  <div id="avviso-presenze" class="avviso-presenze" hidden></div>
+</header>
+
+<main>
+
+  <section class="pannello-ricerca">
+    <div class="ricerca-riga">
+      <div class="campo-ricerca">
+        <input id="q" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Una, due o tre parole: palestra, stage linguistico, conto consuntivo…" aria-label="Testo da cercare">
+        <button id="btn-pulisci" class="pulisci" type="button" title="Svuota il campo" hidden>&times;</button>
+      </div>
+      <button id="btn-cerca" class="bottone primario grande" type="button">Cerca</button>
+    </div>
+
+    <div class="opzioni">
+      <div class="gruppo-opzione" role="radiogroup" aria-label="Tipo di ricerca">
+        <label class="segmento"><input type="radio" name="modo" value="parole" checked><span>Parole</span></label>
+        <label class="segmento"><input type="radio" name="modo" value="frase"><span>Frase esatta</span></label>
+        <label class="segmento"><input type="radio" name="modo" value="numero"><span>Numero</span></label>
+        <label class="segmento"><input type="radio" name="modo" value="data"><span>Data</span></label>
+      </div>
+
+      <label class="opzione-inline solo-testo" title="Cerca anche le forme derivate: deliber → delibera, deliberato, deliberazione">
+        <input type="checkbox" id="opt-prefisso"> Forme derivate
+      </label>
+
+      <label class="opzione-inline solo-testo">
+        Ambito
+        <select id="opt-ambito" title="Dove devono comparire tutti i termini cercati">
+          <option value="paragrafo" selected>stesso paragrafo</option>
+          <option value="punto">stesso punto all'o.d.g.</option>
+          <option value="verbale">stesso verbale</option>
+        </select>
+      </label>
+
+      <label class="opzione-inline solo-testo">
+        Ordina
+        <select id="opt-ordine">
+          <option value="recenti" selected>verbali più recenti</option>
+          <option value="cronologico">ordine cronologico</option>
+          <option value="pertinenza">numero di occorrenze</option>
+        </select>
+      </label>
+
+      <label class="opzione-inline solo-testo">
+        <input type="checkbox" id="opt-solo-delibere"> Solo punti con delibera
+      </label>
+
+      <span class="nota-modo solo-numero">Si digita il numero: <code>10</code>, <code>verbale 10</code>,
+        <code>delibera 96</code>, <code>d 96/2025-26</code>. Per il verbale viene restituito l'ordine del
+        giorno, per la delibera il testo integrale.</span>
+
+      <span class="nota-modo solo-data">Si digita la data: <code>23/04/2026</code>, <code>23 aprile 2026</code>,
+        <code>aprile 2026</code>, <code>2026</code>, <code>a.s. 2025/26</code>,
+        <code>dal 01/01/2026 al 30/06/2026</code>. Viene restituito l'ordine del giorno delle sedute
+        corrispondenti.</span>
+    </div>
+    <div id="avviso-modo" class="avviso-modo"></div>
+  </section>
+
+  <nav class="schede" role="tablist">
+    <button class="scheda attiva" data-scheda="risultati" role="tab">Risultati</button>
+    <button class="scheda" data-scheda="verbali" role="tab">Verbali</button>
+    <button class="scheda" data-scheda="delibere" role="tab">Delibere</button>
+    <button class="scheda" data-scheda="presenze" role="tab">Presenze<span id="conta-presenze" class="contatore allarme" hidden></span></button>
+  <button class="scheda" data-scheda="condivisione" role="tab">Da condividere<span id="conta-raccolta" class="contatore" hidden></span></button>
+    <button class="scheda" data-scheda="cestino" role="tab">Cestino<span id="conta-cestino" class="contatore" hidden></span></button>
+    <button class="scheda" data-scheda="diagnostica" role="tab">Diagnostica</button>
+  </nav>
+
+  <section id="vista-risultati" class="vista"></section>
+  <section id="vista-verbali" class="vista" hidden></section>
+  <section id="vista-delibere" class="vista" hidden></section>
+  <section id="vista-presenze" class="vista" hidden></section>
+  <section id="vista-condivisione" class="vista" hidden></section>
+  <section id="vista-cestino" class="vista" hidden></section>
+  <section id="vista-diagnostica" class="vista" hidden></section>
+
+</main>
+
+<div id="velo-stampa" class="velo-stampa" hidden>
+  <div class="barra-stampa">
+    <div class="barra-titolo">Anteprima di stampa</div>
+    <label class="opzione-stampa">Orientamento
+      <select id="st-orientamento">
+        <option value="orizzontale">orizzontale</option>
+        <option value="verticale">verticale</option>
+      </select>
+    </label>
+    <label class="opzione-stampa"><input type="checkbox" id="st-una-pagina"> in una sola pagina</label>
+    <label class="opzione-stampa"><input type="checkbox" id="st-evidenzia"> evidenzia i termini cercati</label>
+    <span id="st-avviso" class="avviso-stampa"></span>
+    <div class="barra-azioni">
+      <button id="st-stampa" class="bottone primario" type="button">Stampa o salva in PDF</button>
+      <button id="st-chiudi" class="bottone" type="button">Chiudi</button>
+    </div>
+  </div>
+  <div class="area-anteprima">
+    <div id="foglio" class="foglio"><div id="foglio-interno" class="foglio-interno"></div></div>
+  </div>
+</div>
+
+<div id="messaggio" class="messaggio" hidden></div>
+
+<div id="velo" class="velo" hidden>
+  <div class="dialogo">
+    <div id="velo-titolo" class="dialogo-titolo">Indicizzazione</div>
+    <div class="barra"><div id="velo-barra" class="barra-riempimento"></div></div>
+    <div id="velo-testo" class="dialogo-testo"></div>
+  </div>
+</div>
+
+<div id="zona-trascinamento" class="zona-trascinamento" hidden>
+  <div>Rilasciare qui i verbali da aggiungere all'archivio<br><small>formati ammessi: .docx, .pdf, .txt</small></div>
+</div>
+
+<input id="file-input" type="file" accept=".docx,.pdf,.txt,.doc" multiple hidden>
+
+<script src="github.js"></script>
+<script src="vendor/jszip.min.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script src="parser.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
