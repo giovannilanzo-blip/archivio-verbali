@@ -257,6 +257,18 @@
      repository privato, dove erano già stati registrati. */
   var ESCLUSI_PREDEFINITI = [];
 
+  /* Data di inizio del monitoraggio delle presenze. Le sedute anteriori
+     restano indicizzate, ricercabili e consultabili in ogni loro parte: sono
+     escluse soltanto dal prospetto, dai conteggi delle assenze consecutive e
+     dagli avvisi in apertura. Serve quando l'archivio comprende sedute di una
+     consiliatura anteriore, i cui componenti non sono quelli attuali, e
+     realizza lo scopo per il quale si sarebbe altrimenti dovuto cancellare
+     quei verbali, senza perderne il contenuto.
+     Il valore viene immesso una sola volta nei dati salvati, per mezzo
+     dell'indicatore inizioInizializzato: se l'utente lo rimuove, la rimozione
+     non viene annullata al caricamento successivo. */
+  var DATA_INIZIO_PREDEFINITA = '2025-12-18';
+
   function statoPresenze() {
     if (!stato.presenzeDati) {
       stato.presenzeDati = { versione: VERSIONE_PRESENZE };
@@ -274,7 +286,20 @@
       });
       s.esclusiInizializzati = true;
     }
+    if (!s.inizioInizializzato) {
+      if (DATA_INIZIO_PREDEFINITA && !s.dataInizio) {
+        s.dataInizio = DATA_INIZIO_PREDEFINITA;
+        s.dataInizioLabel = itData(DATA_INIZIO_PREDEFINITA);
+      }
+      s.inizioInizializzato = true;
+    }
     return s;
+  }
+
+  /* Data di inizio del monitoraggio, quando ne sia stata fissata una valida. */
+  function inizioMonitoraggio() {
+    var d = statoPresenze().dataInizio;
+    return (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) ? d : null;
   }
 
   /* Vero se il nominativo corrisponde a uno degli esclusi. Il confronto è per
@@ -306,13 +331,35 @@
 
   /* Sedute in ordine cronologico, dalla più antica alla più recente. Le
      assenze consecutive hanno senso soltanto su una successione ordinata. */
-  function seduteOrdinate() {
+  function seduteTutte() {
     return docs().filter(function (d) { return !d.errore; })
       .sort(function (a, b) {
         var ka = a.dataISO || '', kb = b.dataISO || '';
         if (ka !== kb) return ka < kb ? -1 : 1;
         return (a.numero == null ? 0 : a.numero) - (b.numero == null ? 0 : b.numero);
       });
+  }
+
+  /* Le sole sedute che il monitoraggio prende in considerazione. Un verbale
+     privo di data riconosciuta non può essere collocato nella successione e
+     viene conservato, poiché escluderlo in silenzio ne farebbe perdere le
+     presenze senza che l'utente ne sia avvertito: la scheda Presenze segnala
+     separatamente i verbali in questa condizione. */
+  function seduteOrdinate() {
+    var inizio = inizioMonitoraggio();
+    if (!inizio) return seduteTutte();
+    return seduteTutte().filter(function (d) {
+      return !d.dataISO || d.dataISO >= inizio;
+    });
+  }
+
+  /* Sedute lasciate fuori dalla data di inizio del monitoraggio. */
+  function seduteAnteriori() {
+    var inizio = inizioMonitoraggio();
+    if (!inizio) return [];
+    return seduteTutte().filter(function (d) {
+      return d.dataISO && d.dataISO < inizio;
+    });
   }
 
   /* Stato di un componente in una seduta, tenuto conto delle correzioni
@@ -434,6 +481,8 @@
 
     return {
       sedute: sedute,
+      dataInizio: inizioMonitoraggio(),
+      anteriori: seduteAnteriori(),
       conTabella: conTabella,
       senzaTabella: sedute.filter(function (d) { return !(d.presenze && d.presenze.rilevata); }),
       membri: elenco,
@@ -1472,14 +1521,48 @@
     return m.totPresenze + m.totAssenze;
   }
 
-  /* Composizione del Consiglio: dichiarazione di cessazione dal mandato,
-     revoca, e comando che riporta in vista i componenti cessati. */
+  /* Comando con cui si stabilisce da quale seduta il monitoraggio delle
+     presenze abbia inizio. Le sedute anteriori restano nell'archivio e nella
+     ricerca: il limite riguarda il solo conteggio delle assenze. */
+  function bloccoInizioMonitoraggio(p) {
+    var s = statoPresenze();
+    var valore = stato.bozzaDataInizio != null ? stato.bozzaDataInizio :
+      (s.dataInizioLabel || (p.dataInizio ? itData(p.dataInizio) : ''));
+
+    var h = '<div class="modulo-cessazione" style="margin:0 0 12px">';
+    h += '<div style="width:100%"><label>Monitoraggio delle presenze a partire dalla seduta del</label>' +
+      '<input id="data-inizio-monitoraggio" placeholder="18/12/2025 oppure dicembre 2025" value="' +
+      esc(valore) + '"></div>';
+    h += '<button class="bottone minuto primario" data-salva-inizio="1">Applica</button>';
+    if (p.dataInizio) {
+      h += '<button class="bottone minuto" data-azzera-inizio="1">Togli il limite</button>';
+    }
+    h += '<p style="font-size:13px;color:var(--testo-tenue);margin:8px 0 0;width:100%">' +
+      'La data indicata è compresa nel monitoraggio. Le sedute anteriori restano indicizzate, ' +
+      'ricercabili e consultabili per intero: escono soltanto dal prospetto, dai totali e dagli ' +
+      'avvisi per assenze consecutive. Il limite si toglie in qualunque momento, e il prospetto ' +
+      'torna a comprendere l\'intero archivio.';
+    if (p.anteriori.length) {
+      h += '<br><strong>' + p.anteriori.length +
+        (p.anteriori.length === 1 ? ' seduta anteriore non concorre' : ' sedute anteriori non concorrono') +
+        ' al monitoraggio:</strong> ' +
+        esc(p.anteriori.map(function (d) { return etichettaSeduta(d); }).join(' · ')) + '.';
+    }
+    h += '</p></div>';
+    return h;
+  }
+
+  /* Composizione del Consiglio: data di inizio del monitoraggio,
+     dichiarazione di cessazione dal mandato, revoca, e comando che riporta in
+     vista i componenti cessati. */
   function riquadroComposizione(p) {
     var h = '<div class="riquadro" style="margin-top:18px"><h3>Composizione del Consiglio</h3>';
     h += '<p>L\'elenco dei componenti è ricavato dalle tabelle presenze dei verbali. ' +
       'Chi ha cessato il mandato va dichiarato con la relativa decorrenza: le sedute anteriori ' +
       'conservano il dato che i verbali documentano, quelle successive non lo riguardano più, ' +
       'e gli avvisi a suo carico si chiudono.</p>';
+
+    h += bloccoInizioMonitoraggio(p);
 
     h += '<div class="azioni-punto" style="margin:0 0 4px">' +
       '<button class="bottone minuto rilievo" data-apri-cessazione="1">' +
@@ -1605,6 +1688,14 @@
         ' una tabella presenze riconosciuta e non compaiono nel prospetto: ' +
         esc(p.senzaTabella.map(function (d) { return etichettaSeduta(d); }).join(' · ')) + '.</p>';
     }
+    if (p.dataInizio) {
+      h += '<p>Il monitoraggio ha inizio dalla seduta del <strong>' + esc(itData(p.dataInizio)) +
+        '</strong>. ' + (p.anteriori.length
+          ? (p.anteriori.length === 1 ? 'Una seduta anteriore resta' : p.anteriori.length + ' sedute anteriori restano') +
+            ' nell\'archivio e nella ricerca, fuori dal prospetto e dai conteggi. '
+          : '') +
+        'Il limite si modifica nel riquadro «Composizione del Consiglio», più sotto.</p>';
+    }
     h += '</div>';
 
     var visibili = stato.mostraCessati ? p.membri : p.attuali;
@@ -1708,6 +1799,51 @@
     var an = analizzaData(testo || '');
     if (!an || !an.intervalli.length) return null;
     return an.intervalli[0].da;
+  }
+
+  /* ------------------------- data di inizio del monitoraggio */
+
+  function registraInizioMonitoraggio() {
+    var campo = el('data-inizio-monitoraggio');
+    var testo = campo ? campo.value.trim() : '';
+    var s = statoPresenze();
+    if (!testo) { azzeraInizioMonitoraggio(true); return; }
+    var data = decorrenzaCessazione(testo);
+    if (!data) {
+      alert('Non è stata riconosciuta la data di inizio del monitoraggio.\n\n' +
+        'Sono ammesse forme quali 18/12/2025, 18 dicembre 2025, dicembre 2025.');
+      return;
+    }
+    s.dataInizio = data;
+    s.dataInizioLabel = itData(data);
+    stato.bozzaDataInizio = null;
+    salvaPresenze().then(function () {
+      disegnaPresenze();
+      var p = stato.presenzeCalcolo || calcolaPresenze();
+      alert('Il monitoraggio delle presenze ha inizio dalla seduta del ' + itData(data) + '.\n\n' +
+        (p.anteriori.length
+          ? p.anteriori.length + (p.anteriori.length === 1
+            ? ' seduta anteriore resta nell\'archivio e nella ricerca, fuori dal prospetto.'
+            : ' sedute anteriori restano nell\'archivio e nella ricerca, fuori dal prospetto.')
+          : 'Nessuna seduta dell\'archivio è anteriore a questa data.'));
+    });
+  }
+
+  /* Conserva quanto digitato nel campo della data di inizio, perché un
+     ridisegno della scheda provocato da un altro comando non lo perda. */
+  function memorizzaBozzaInizio() {
+    var c = el('data-inizio-monitoraggio');
+    if (c) stato.bozzaDataInizio = c.value;
+  }
+
+  function azzeraInizioMonitoraggio(tacito) {
+    if (!tacito && !confirm('Togliere il limite?\n\nIl prospetto e gli avvisi torneranno a comprendere ' +
+      'tutte le sedute dell\'archivio, comprese quelle anteriori.')) return;
+    var s = statoPresenze();
+    delete s.dataInizio;
+    delete s.dataInizioLabel;
+    stato.bozzaDataInizio = null;
+    salvaPresenze().then(function () { disegnaPresenze(); });
   }
 
   function registraCessazione() {
@@ -2422,6 +2558,15 @@
           (p.cessati.length === 1 ? ' componente cessato dal mandato non compare' : ' componenti cessati dal mandato non compaiono') +
           ' nel prospetto.';
       }
+      if (p.dataInizio) {
+        h += '<br>Il prospetto ha inizio dalla seduta del ' + esc(itData(p.dataInizio)) + '.';
+        if (p.anteriori.length) {
+          h += ' ' + (p.anteriori.length === 1
+            ? 'Una seduta anteriore, conservata nell\'archivio, non concorre al conteggio: '
+            : p.anteriori.length + ' sedute anteriori, conservate nell\'archivio, non concorrono al conteggio: ') +
+            esc(p.anteriori.map(etichettaSeduta).join(' · ')) + '.';
+        }
+      }
       h += '</div>';
     }
 
@@ -3027,7 +3172,8 @@
         '[data-apri-cestino],[data-espandi],[data-cella],[data-silenzia],[data-apri-decadenza],' +
         '[data-salva-decadenza],[data-revoca-decadenza],[data-scheda-vai],' +
         '[data-apri-cessazione],[data-salva-cessazione],[data-revoca-cessazione],' +
-        '[data-apri-esclusione],[data-salva-esclusione],[data-reintegra]';
+        '[data-apri-esclusione],[data-salva-esclusione],[data-reintegra],' +
+        '[data-salva-inizio],[data-azzera-inizio]';
       var b = e.target.closest ? e.target.closest(sel) : null;
       if (!b) return;
 
@@ -3039,6 +3185,7 @@
       if (b.dataset.apriCessazione) {
         var campoData = el('data-cessazione');
         stato.bozzaDataCessazione = campoData ? campoData.value : '';
+        memorizzaBozzaInizio();
         stato.pannelloCessazione = !stato.pannelloCessazione;
         disegnaPresenze();
         var nuovo = el('data-cessazione');
@@ -3048,10 +3195,13 @@
       if (b.dataset.salvaCessazione) { registraCessazione(); return; }
       if (b.dataset.revocaCessazione) { revocaCessazione(b.dataset.revocaCessazione); return; }
       if (b.dataset.apriEsclusione) {
+        memorizzaBozzaInizio();
         stato.pannelloEsclusione = !stato.pannelloEsclusione;
         disegnaPresenze();
         return;
       }
+      if (b.dataset.salvaInizio) { registraInizioMonitoraggio(); return; }
+      if (b.dataset.azzeraInizio) { azzeraInizioMonitoraggio(false); return; }
       if (b.dataset.salvaEsclusione) { registraEsclusione(); return; }
       if (b.dataset.reintegra) { reintegraEscluso(parseInt(b.dataset.reintegra, 10)); return; }
       if (b.dataset.cella) { commutaCella(b.dataset.cella, b.dataset.chiave); return; }
@@ -3137,6 +3287,13 @@
         .then(function () {
           return chiediJson('/api/presenze').then(function (pr) {
             if (pr && pr.versione === VERSIONE_PRESENZE) stato.presenzeDati = pr;
+            /* La prima immissione dei valori predefiniti viene registrata nei
+               dati salvati, così che la scelta risieda nel repository e non
+               dipenda da una costante del codice: le installazioni successive
+               la trovano già fatta, e una eventuale rimozione da parte
+               dell'utente resta tale. */
+            statoPresenze();
+            if (!pr || !pr.inizioInizializzato) return salvaPresenze();
           }).catch(function () { });
         })
         .then(ridisegnaTutto);
