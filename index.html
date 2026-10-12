@@ -23,6 +23,7 @@
       <div class="menu-contenitore">
         <button id="btn-altro" class="bottone solo-icona" type="button" title="Altre azioni" aria-haspopup="true">&#8943;</button>
         <div id="menu-altro" class="menu" hidden>
+          <button type="button" data-azione="cerca">Cerca nei verbali</button>
           <button type="button" data-azione="reindicizza">Reindicizza tutto da zero</button>
           <button type="button" data-azione="cartella">Apri l'archivio su GitHub</button>
           <button type="button" data-azione="esporta">Esporta l'indice delle delibere (CSV)</button>
@@ -49,7 +50,7 @@
   <div id="avviso-presenze" class="avviso-presenze" hidden></div>
   <div id="stato-archivio" class="stato-archivio">Avvio in corso…</div>
 
-  <section class="pannello-ricerca">
+  <section class="pannello-ricerca" id="pannello-ricerca" hidden>
     <div class="ricerca-riga">
       <div class="campo-ricerca">
         <input id="q" type="search" autocomplete="off" spellcheck="false"
