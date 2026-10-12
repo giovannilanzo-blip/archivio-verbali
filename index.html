@@ -21,8 +21,6 @@
       <div class="marchio-sottotitolo">Liceo Scientifico Statale &ldquo;Nicolò Palmeri&rdquo; &middot; Termini Imerese</div>
     </div>
     <div class="azioni-testata">
-      <button id="btn-carica" class="bottone primario" type="button">Carica verbali</button>
-      <button id="btn-aggiorna" class="bottone" type="button">Aggiorna indice</button>
       <div class="menu-contenitore">
         <button id="btn-altro" class="bottone solo-icona" type="button" title="Altre azioni" aria-haspopup="true">&#8943;</button>
         <div id="menu-altro" class="menu" hidden>
@@ -38,6 +36,16 @@
   </div>
   <div id="stato-archivio" class="stato-archivio">Avvio in corso…</div>
   <div id="avviso-presenze" class="avviso-presenze" hidden></div>
+
+  <nav class="schede" role="tablist">
+    <button class="scheda attiva" data-scheda="risultati" role="tab">Risultati</button>
+    <button class="scheda" data-scheda="verbali" role="tab">Verbali</button>
+    <button class="scheda" data-scheda="delibere" role="tab">Delibere</button>
+    <button class="scheda" data-scheda="presenze" role="tab">Presenze<span id="conta-presenze" class="contatore allarme" hidden></span></button>
+    <button class="scheda" data-scheda="condivisione" role="tab">Da condividere<span id="conta-raccolta" class="contatore" hidden></span></button>
+    <button class="scheda" data-scheda="cestino" role="tab">Cestino<span id="conta-cestino" class="contatore" hidden></span></button>
+    <button class="scheda" data-scheda="diagnostica" role="tab">Diagnostica</button>
+  </nav>
 </header>
 
 <main>
@@ -98,17 +106,11 @@
     <div id="avviso-modo" class="avviso-modo"></div>
   </section>
 
-  <nav class="schede" role="tablist">
-    <button class="scheda attiva" data-scheda="risultati" role="tab">Risultati</button>
-    <button class="scheda" data-scheda="verbali" role="tab">Verbali</button>
-    <button class="scheda" data-scheda="delibere" role="tab">Delibere</button>
-    <button class="scheda" data-scheda="presenze" role="tab">Presenze<span id="conta-presenze" class="contatore allarme" hidden></span></button>
-  <button class="scheda" data-scheda="condivisione" role="tab">Da condividere<span id="conta-raccolta" class="contatore" hidden></span></button>
-    <button class="scheda" data-scheda="cestino" role="tab">Cestino<span id="conta-cestino" class="contatore" hidden></span></button>
-    <button class="scheda" data-scheda="diagnostica" role="tab">Diagnostica</button>
-  </nav>
-
   <section id="vista-risultati" class="vista"></section>
+  <div id="azioni-verbali" class="azioni-verbali" hidden>
+    <button id="btn-carica" class="bottone primario" type="button">Carica verbali</button>
+    <button id="btn-aggiorna" class="bottone" type="button">Aggiorna indice</button>
+  </div>
   <section id="vista-verbali" class="vista" hidden></section>
   <section id="vista-delibere" class="vista" hidden></section>
   <section id="vista-presenze" class="vista" hidden></section>
