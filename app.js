@@ -1175,7 +1175,9 @@
         'Nessun verbale presente nell\'archivio.</div>';
       return;
     }
-    var h = '<div class="riepilogo">' + arr.length + (arr.length === 1 ? ' file' : ' file') + ' nell\'archivio. Un clic sulla riga mostra i punti all\'ordine del giorno.</div>';
+    /* La tabella è la prima cosa sotto la barra delle schede: la nota che la
+       spiega viene dopo. */
+    var h = '';
     h += '<div class="tabella-contenitore"><table><thead><tr>' +
       '<th class="num">Verbale</th><th>Seduta</th><th class="num">Punti</th><th class="num">Delibere</th>' +
       '<th>Delibere adottate</th><th>File</th></tr></thead><tbody>';
@@ -1215,6 +1217,8 @@
       h += '</td></tr>';
     });
     h += '</tbody></table></div>';
+    h += '<div class="riepilogo" style="margin-top:12px">' + arr.length +
+      ' file nell\'archivio. Un clic sulla riga mostra i punti all\'ordine del giorno.</div>';
     el('vista-verbali').innerHTML = h;
     stato._verbaliOrdinati = arr;
   }
@@ -1398,12 +1402,13 @@
         'La rimozione si comanda dalla scheda Verbali, espandendo la riga del verbale.</div>';
       return;
     }
-    var h = '<div class="riquadro"><h3>Verbali rimossi dall\'archivio</h3>' +
+    var coda = '<div class="riquadro" style="margin-top:14px"><h3>Verbali rimossi dall\'archivio</h3>' +
       '<p>Questi file non compaiono più nell\'archivio e i loro dati sono stati cancellati ' +
       'dall\'indice, ma restano nel repository dei dati, nella cartella <span class="mono">' +
       esc(stato.cartellaCestino || 'Cestino') + '</span>. Il ripristino li riporta ' +
       'nell\'archivio e li reindicizza. La cancellazione definitiva non è reversibile.</p></div>';
 
+    var h = '';
     h += '<div class="tabella-contenitore"><table><thead><tr>' +
       '<th>File rimosso</th><th>Rimosso il</th><th class="num">Dimensione</th><th>Operazioni</th>' +
       '</tr></thead><tbody>';
@@ -1424,6 +1429,7 @@
         '</div></td></tr>';
     });
     h += '</tbody></table></div>';
+    h += coda;
     el('vista-cestino').innerHTML = h;
   }
 
@@ -1434,45 +1440,21 @@
   }
 
   function disegnaAvvisoPresenze(p) {
-    var box = el('avviso-presenze');
+    /* La segnalazione non occupa più una fascia nella pagina: resta una spia
+       sulla linguetta «Presenze», che pulsa finché ci sono avvisi attivi e
+       porta il numero dei componenti segnalati. Il dettaglio sta nella scheda,
+       dove si va con un tocco. */
     var conta = el('conta-presenze');
-
+    if (!conta) return;
     var rossi = p.allarmi.filter(function (m) { return m.livello === 'rosso'; });
-    var arancioni = p.allarmi.filter(function (m) { return m.livello === 'arancione'; });
-
     conta.textContent = p.allarmi.length;
     conta.hidden = p.allarmi.length === 0;
-    conta.className = 'contatore' + (rossi.length ? ' allarme' : '');
-
-    if (!p.allarmi.length) { box.hidden = true; return; }
-
-    box.hidden = false;
-    box.className = 'avviso-presenze' + (rossi.length ? '' : ' solo-arancione');
-
-    var h = '<div class="corpo">';
-    if (rossi.length) {
-      h += '<div class="lampeggio"><span class="pallino"></span><strong>' +
-        (rossi.length === 1 ? 'Un componente ha' : rossi.length + ' componenti hanno') +
-        ' più di due assenze consecutive.</strong></div>' +
-        '<div class="nomi">' + rossi.map(function (m) {
-          return esc(m.nome) + ' (' + m.serieMax + ' assenze consecutive)';
-        }).join('; ') + '</div>';
-    }
-    if (arancioni.length) {
-      h += '<div class="lampeggio' + (rossi.length ? ' secondo' : '') + '">' +
-        '<span class="pallino"></span><strong>' +
-        (arancioni.length === 1 ? 'Un componente ha' : arancioni.length + ' componenti hanno') +
-        ' due assenze consecutive.</strong></div>' +
-        '<div class="nomi">' + arancioni.map(function (m) { return esc(m.nome); }).join('; ') + '</div>';
-    }
-    h += '</div>' +
-      /* Sintesi di una riga, mostrata al posto del testo esteso quando la
-         testata si riduce durante lo scorrimento: l'avviso resta visibile e
-         continua a pulsare senza occupare lo schermo. */
-      '<div class="sintesi lampeggio">' + p.allarmi.length +
-      (p.allarmi.length === 1 ? ' avviso' : ' avvisi') + ' sulle assenze</div>' +
-      '<button class="bottone minuto" data-scheda-vai="presenze">Apri la scheda Presenze</button>';
-    box.innerHTML = h;
+    conta.className = 'contatore' + (rossi.length ? ' allarme' : '') + (p.allarmi.length ? ' lampeggio' : '');
+    conta.title = p.allarmi.length
+      ? p.allarmi.map(function (m) {
+          return m.nome + (m.livello === 'rosso' ? ' (oltre due assenze consecutive)' : ' (due assenze consecutive)');
+        }).join('; ')
+      : '';
   }
 
   function schedaAllarme(m) {
@@ -2919,7 +2901,9 @@
     aggiornaContatoreRaccolta();
 
     var h = '';
-    h += '<div class="riquadro"><h3>Documento da condividere</h3>' +
+    /* L'intestazione del documento viene dopo l'elenco delle voci raccolte:
+       sotto la barra delle schede sta ciò che la scheda contiene. */
+    var intestazione = '<div class="riquadro" style="margin-top:14px"><h3>Documento da condividere</h3>' +
       '<p>Gli elementi raccolti nelle altre schede vengono composti in un unico documento, ' +
       'che si stampa oppure si salva in PDF scegliendo «Salva come PDF» fra le destinazioni ' +
       'della finestra di stampa.</p>' +
@@ -3003,6 +2987,8 @@
       '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto delle presenze</button>' +
       '<button class="bottone minuto pericolo" data-svuota-raccolta="1">Svuota la raccolta</button>' +
       '</div>';
+
+    h += intestazione;
 
     vista.innerHTML = h;
     agganciaCampiRaccolta();
