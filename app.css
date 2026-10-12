@@ -82,13 +82,6 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
    le righe principali dell'avviso sulle assenze. */
 .testata.compatta { padding: 8px 20px 0; box-shadow: 0 2px 10px rgba(0, 0, 0, .07); }
 .testata.compatta .marchio-titolo { font-size: 16px; }
-.testata.compatta .marchio-sottotitolo,
-.testata.compatta .stato-archivio,
-.testata.compatta .avviso-presenze .nomi { display: none; }
-.testata.compatta .avviso-presenze { margin: 7px auto 0; padding: 6px 11px; font-size: 12.5px; flex-wrap: nowrap; align-items: center; }
-.testata.compatta .avviso-presenze .corpo { display: none; }
-.testata.compatta .avviso-presenze .sintesi { display: block; flex: 1; min-width: 0; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.testata.compatta .avviso-presenze .bottone { flex: 0 0 auto; }
 .testata.compatta .avviso-presenze .lampeggio.secondo { margin-top: 0; }
 
 .testata-riga {
@@ -102,6 +95,7 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
 }
 
 .marchio-titolo { font-family: var(--serif); font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
+.titolo-breve { display: none; }
 .marchio-sottotitolo { color: var(--testo-tenue); font-size: 12.5px; margin-top: 1px; }
 
 .azioni-testata { display: flex; gap: 8px; align-items: center; }
@@ -111,7 +105,7 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
 
 .stato-archivio {
   max-width: 1040px;
-  margin: 10px auto 0;
+  margin: 14px auto 0;
   font-size: 12.5px;
   color: var(--testo-tenue);
   font-family: var(--mono);
@@ -278,7 +272,7 @@ body.modo-data .solo-testo { display: none; }
 
 .avviso-presenze {
   max-width: 1040px;
-  margin: 11px auto 2px;
+  margin: 16px auto 0;
   border-radius: 9px;
   padding: 10px 14px;
   font-size: 13.5px;
@@ -630,6 +624,10 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   .ricerca-riga { flex-direction: column; }
   .intestazione-verbale .nomefile { margin-left: 0; width: 100%; }
   .azioni-testata { width: auto; }
+  /* sullo schermo stretto il titolo per esteso andrebbe a capo e alzerebbe
+     la testata di una riga: se ne mostra la forma breve */
+  .titolo-esteso { display: none; }
+  .titolo-breve { display: inline; }
   /* Sullo schermo del telefono la testata ridotta rinuncia anche al titolo:
      restano i comandi, l'eventuale avviso e la barra delle schede, che sono
      le sole parti utili mentre si scorre. */
@@ -856,7 +854,12 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   .tabella-contenitore { overflow-x: auto; max-width: 100%; }
   .stato-archivio .percorso { overflow-wrap: anywhere; }
   .azioni-punto { flex-wrap: wrap; }
-  .menu { max-width: calc(100vw - 32px); }
+  .menu {
+    left: 0; right: auto;
+    min-width: 0;
+    width: calc(100vw - 32px);
+    max-width: 320px;
+  }
 }
 
 /* ------------------------------ anteprima e prospetto sullo schermo del telefono */
