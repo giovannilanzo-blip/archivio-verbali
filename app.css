@@ -11,14 +11,14 @@
   --testo-debole: #8a8d84;
   --bordo: #e0e0db;
   --bordo-forte: #c9cac3;
-  --accento: #2f5d3f;
-  --accento-chiaro: #eaf1ec;
+  --accento: #1f4e79;
+  --accento-chiaro: #e6ecf0;
   --accento-testo: #ffffff;
   --evidenza: #fff2a8;
   --evidenza-bordo: #e8d45f;
   --allerta: #8a3324;
   --allerta-sfondo: #fbeeeb;
-  --ok: #2f5d3f;
+  --ok: #1f4e79;
   --ombra: 0 1px 2px rgba(20, 22, 18, .05), 0 4px 14px rgba(20, 22, 18, .05);
   --raggio: 10px;
   --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
@@ -36,14 +36,14 @@
     --testo-debole: #7d8176;
     --bordo: #2f322a;
     --bordo-forte: #454940;
-    --accento: #8fc4a2;
-    --accento-chiaro: #22301f;
-    --accento-testo: #10170f;
+    --accento: #93bce4;
+    --accento-chiaro: #1b2735;
+    --accento-testo: #0d141c;
     --evidenza: #5e5320;
     --evidenza-bordo: #8d7c2c;
     --allerta: #e8a294;
     --allerta-sfondo: #32211d;
-    --ok: #8fc4a2;
+    --ok: #93bce4;
     --ombra: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 14px rgba(0, 0, 0, .25);
   }
 }
@@ -714,17 +714,17 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   font-family: "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
   font-size: 10.5pt; line-height: 1.36;
 }
-.doc-stampa .intestazione-foglio { border-bottom: 1.6pt solid #2f5d3f; padding-bottom: 6pt; margin-bottom: 12pt; }
+.doc-stampa .intestazione-foglio { border-bottom: 1.6pt solid #1f4e79; padding-bottom: 6pt; margin-bottom: 12pt; }
 .doc-stampa .ente {
   font-family: Arial, Helvetica, sans-serif; font-size: 8.5pt;
   letter-spacing: .06em; text-transform: uppercase; color: #4a4d44;
 }
-.doc-stampa .organo { font-size: 12pt; font-weight: 600; color: #2f5d3f; margin-top: 1pt; }
+.doc-stampa .organo { font-size: 12pt; font-weight: 600; color: #1f4e79; margin-top: 1pt; }
 .doc-stampa h1 { font-size: 16pt; font-weight: 600; margin: 7pt 0 2pt; }
 .doc-stampa .sottotitolo-foglio { font-size: 9.5pt; color: #4a4d44; }
 .doc-stampa .nota-intestazione {
   font-size: 10pt; margin: 8pt 0 0; padding: 6pt 9pt;
-  background: #f2f5f2; border-left: 2.5pt solid #2f5d3f;
+  background: #f1f4f7; border-left: 2.5pt solid #1f4e79;
   -webkit-print-color-adjust: exact; print-color-adjust: exact;
 }
 .doc-stampa .blocco { margin-bottom: 13pt; }
@@ -751,7 +751,7 @@ td.mono { font-family: var(--mono); font-size: 12px; }
 .doc-stampa ul.odg-stampa { list-style: none; margin: 0; padding: 0; }
 .doc-stampa ul.odg-stampa li { margin-bottom: 2.5pt; padding-left: 17pt; text-indent: -17pt; }
 .doc-stampa ul.odg-stampa li.sotto { padding-left: 32pt; text-indent: -15pt; font-size: 10pt; }
-.doc-stampa .segno { font-family: Arial, Helvetica, sans-serif; font-size: 8pt; color: #2f5d3f; white-space: nowrap; }
+.doc-stampa .segno { font-family: Arial, Helvetica, sans-serif; font-size: 8pt; color: #1f4e79; white-space: nowrap; }
 
 .doc-stampa table.prospetto {
   border-collapse: collapse; width: 100%;
@@ -760,7 +760,7 @@ td.mono { font-family: var(--mono); font-size: 12px; }
 .doc-stampa table.prospetto th,
 .doc-stampa table.prospetto td { border: .5pt solid #b9bab3; padding: 1.6pt 3pt; text-align: center; vertical-align: middle; }
 .doc-stampa table.prospetto thead th {
-  background: #eaf1ec; font-weight: 700; line-height: 1.15;
+  background: #e6ecf0; font-weight: 700; line-height: 1.15;
   -webkit-print-color-adjust: exact; print-color-adjust: exact;
 }
 .doc-stampa table.prospetto th.seduta small { display: block; font-weight: 400; font-size: .82em; color: #4a4d44; }
