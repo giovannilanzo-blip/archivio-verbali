@@ -1084,7 +1084,9 @@
       docs().forEach(function (d) { nd += (d.delibere || []).length; });
       v.innerHTML = '<div class="vuoto"><span class="grande">Archivio pronto alla consultazione</span>' +
         esc(n) + ' verbali indicizzati, ' + esc(nd) + ' delibere censite.<br>' +
-        'Digitare una, due o tre parole nel campo qui sopra.</div>';
+        'La ricerca si apre dal menu \u22ef in alto a destra, voce «Cerca nei verbali».' +
+        '<div class="azioni-punto" style="justify-content:center;margin-top:14px">' +
+        '<button class="bottone primario" data-apri-ricerca="1">Cerca nei verbali</button></div></div>';
       return;
     }
 
@@ -1663,50 +1665,49 @@
       return;
     }
 
+    /* La scheda comincia con il prospetto, subito sotto la barra delle schede,
+       perché è ciò per cui la si apre. Seguono le note di lettura, le
+       segnalazioni, la composizione del Consiglio e, in fondo, i comandi di
+       esportazione. */
     var h = '';
+    var segnalazioni = '';
 
-    // avvisi in corso e provvedimenti
     var daMostrare = p.membri.filter(function (m) {
       return m.livello === 'rosso' || m.livello === 'arancione' || m.livello === 'chiuso';
     });
     if (daMostrare.length) {
-      h += '<div class="riepilogo">' + daMostrare.length +
+      segnalazioni += '<div class="riepilogo">' + daMostrare.length +
         (daMostrare.length === 1 ? ' componente segnalato' : ' componenti segnalati') + '.</div>';
-      daMostrare.forEach(function (m) { h += schedaAllarme(m); });
+      daMostrare.forEach(function (m) { segnalazioni += schedaAllarme(m); });
     } else {
-      h += '<div class="riquadro"><h3>Nessuna segnalazione</h3>' +
+      segnalazioni += '<div class="riquadro"><h3>Nessuna segnalazione</h3>' +
         '<p>Nessun componente presenta due o più assenze consecutive nelle sedute indicizzate.</p></div>';
     }
 
-    // prospetto completo
-    h += '<div class="riquadro" style="margin-top:18px"><h3>Prospetto delle presenze</h3>' +
-      '<div class="azioni-punto" style="margin:0 0 8px">' +
-      '<button class="bottone minuto rilievo" data-stampa-presenze="1">Esporta il prospetto in PDF</button>' +
-      '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto alla raccolta</button>' +
-      '</div>' +
+    var note = '<div class="riquadro" style="margin-top:14px"><h3>Come si legge il prospetto</h3>' +
       '<p>Una colonna per seduta, in ordine cronologico. <strong>P</strong> indica presenza, ' +
       '<strong>A</strong> assenza, il trattino che il componente non risulta negli elenchi di quella seduta. ' +
       'Un clic sulla casella ne corregge il contenuto, quando l\'estrazione automatica abbia sbagliato; ' +
       'le caselle corrette portano un puntino.</p>';
     if (p.senzaTabella.length) {
-      h += '<p style="color:var(--allerta)">' + p.senzaTabella.length +
+      note += '<p style="color:var(--allerta)">' + p.senzaTabella.length +
         (p.senzaTabella.length === 1 ? ' verbale non ha' : ' verbali non hanno') +
         ' una tabella presenze riconosciuta e non compaiono nel prospetto: ' +
         esc(p.senzaTabella.map(function (d) { return etichettaSeduta(d); }).join(' · ')) + '.</p>';
     }
     if (p.dataInizio) {
-      h += '<p>Il monitoraggio ha inizio dalla seduta del <strong>' + esc(itData(p.dataInizio)) +
+      note += '<p>Il monitoraggio ha inizio dalla seduta del <strong>' + esc(itData(p.dataInizio)) +
         '</strong>. ' + (p.anteriori.length
           ? (p.anteriori.length === 1 ? 'Una seduta anteriore resta' : p.anteriori.length + ' sedute anteriori restano') +
             ' nell\'archivio e nella ricerca, fuori dal prospetto e dai conteggi. '
           : '') +
         'Il limite si modifica nel riquadro «Composizione del Consiglio», più sotto.</p>';
     }
-    h += '</div>';
+    note += '</div>';
 
     var visibili = stato.mostraCessati ? p.membri : p.attuali;
     if (p.cessati.length && !stato.mostraCessati) {
-      h += '<p style="font-size:12.5px;color:var(--testo-debole);margin:-4px 0 10px">' +
+      h += '<p style="font-size:12.5px;color:var(--testo-debole);margin:0 0 10px">' +
         p.cessati.length + (p.cessati.length === 1 ? ' componente cessato dal mandato non compare' : ' componenti cessati dal mandato non compaiono') +
         ' nel prospetto. Il comando che li riporta in vista si trova nel riquadro «Composizione del Consiglio», più sotto.</p>';
     }
@@ -1744,7 +1745,17 @@
     });
     h += '</tbody></table></div>';
 
+    h += note;
+    h += segnalazioni;
     h += riquadroComposizione(p);
+
+    /* I comandi di esportazione chiudono la pagina: si usano dopo aver letto
+       il prospetto, non prima. */
+    h += '<div class="riquadro" style="margin-top:18px"><h3>Esportazione</h3>' +
+      '<div class="azioni-punto" style="margin:0">' +
+      '<button class="bottone minuto rilievo" data-stampa-presenze="1">Esporta il prospetto in PDF</button>' +
+      '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto alla raccolta</button>' +
+      '</div></div>';
 
     el('vista-presenze').innerHTML = h;
   }
@@ -3143,6 +3154,7 @@
       var a = e.target.dataset.azione;
       if (!a) return;
       el('menu-altro').hidden = true;
+      if (a === 'cerca') { apriRicerca(); return; }
       if (a === 'reindicizza') {
         if (!confirm('Ricostruire l\'indice leggendo da capo tutti i verbali? L\'operazione può richiedere qualche minuto.')) return;
         costruisciIndice(true).then(ridisegnaTutto);
@@ -3200,7 +3212,7 @@
         '[data-salva-decadenza],[data-revoca-decadenza],[data-scheda-vai],' +
         '[data-apri-cessazione],[data-salva-cessazione],[data-revoca-cessazione],' +
         '[data-apri-esclusione],[data-salva-esclusione],[data-reintegra],' +
-        '[data-salva-inizio],[data-azzera-inizio]';
+        '[data-salva-inizio],[data-azzera-inizio],[data-apri-ricerca]';
       var b = e.target.closest ? e.target.closest(sel) : null;
       if (!b) return;
 
@@ -3227,6 +3239,7 @@
         disegnaPresenze();
         return;
       }
+      if (b.dataset.apriRicerca) { apriRicerca(true); return; }
       if (b.dataset.salvaInizio) { registraInizioMonitoraggio(); return; }
       if (b.dataset.azzeraInizio) { azzeraInizioMonitoraggio(false); return; }
       if (b.dataset.salvaEsclusione) { registraEsclusione(); return; }
@@ -3278,7 +3291,7 @@
     });
 
     document.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); el('q').focus(); el('q').select(); }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); apriRicerca(true); }
     });
 
     agganciaTestataCompatta();
@@ -3305,6 +3318,22 @@
       window.requestAnimationFrame(valuta);
     }, { passive: true });
     valuta();
+  }
+
+  /* Il riquadro di ricerca sta chiuso e si apre dal menu delle azioni,
+     oppure con Ctrl+F. Aprendolo si passa alla scheda dei risultati, perché è
+     là che la ricerca si legge. */
+  function apriRicerca(forza) {
+    var r = el('pannello-ricerca');
+    if (!r) return;
+    var apri = forza === true ? true : r.hidden;
+    r.hidden = !apri;
+    if (!apri) return;
+    var t = document.querySelector('.scheda[data-scheda="risultati"]');
+    if (t && !t.classList.contains('attiva')) t.click();
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    var q = el('q');
+    if (q) { q.focus(); q.select(); }
   }
 
   /* --------------------------------------------------------------- avvio */
