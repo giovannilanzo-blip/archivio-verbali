@@ -1457,13 +1457,19 @@
         }).join('; ') + '</div>';
     }
     if (arancioni.length) {
-      h += '<div class="lampeggio"' + (rossi.length ? ' style="margin-top:7px"' : '') + '>' +
+      h += '<div class="lampeggio' + (rossi.length ? ' secondo' : '') + '">' +
         '<span class="pallino"></span><strong>' +
         (arancioni.length === 1 ? 'Un componente ha' : arancioni.length + ' componenti hanno') +
         ' due assenze consecutive.</strong></div>' +
         '<div class="nomi">' + arancioni.map(function (m) { return esc(m.nome); }).join('; ') + '</div>';
     }
-    h += '</div><button class="bottone minuto" data-scheda-vai="presenze">Apri la scheda Presenze</button>';
+    h += '</div>' +
+      /* Sintesi di una riga, mostrata al posto del testo esteso quando la
+         testata si riduce durante lo scorrimento: l'avviso resta visibile e
+         continua a pulsare senza occupare lo schermo. */
+      '<div class="sintesi lampeggio">' + p.allarmi.length +
+      (p.allarmi.length === 1 ? ' avviso' : ' avvisi') + ' sulle assenze</div>' +
+      '<button class="bottone minuto" data-scheda-vai="presenze">Apri la scheda Presenze</button>';
     box.innerHTML = h;
   }
 
@@ -3103,6 +3109,11 @@
         ['risultati', 'verbali', 'delibere', 'presenze', 'condivisione', 'cestino', 'diagnostica'].forEach(function (v) {
           el('vista-' + v).hidden = (v !== b.dataset.scheda);
         });
+        /* I comandi di caricamento e di aggiornamento appartengono alla
+           gestione dell'archivio e compaiono soltanto nella scheda Verbali,
+           in testa all'elenco dei file. La testata ospita la sola barra
+           delle schede, oltre al menu delle altre azioni. */
+        el('azioni-verbali').hidden = (b.dataset.scheda !== 'verbali');
       });
     });
 
@@ -3253,6 +3264,31 @@
     document.addEventListener('keydown', function (e) {
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); el('q').focus(); el('q').select(); }
     });
+
+    agganciaTestataCompatta();
+  }
+
+  /* La testata resta agganciata in cima allo schermo. Appena la pagina si
+     muove viene ridotta, così da non sottrarre spazio alla lettura. Le due
+     soglie sono diverse di proposito: una sola soglia farebbe oscillare la
+     testata fra i due stati quando lo scorrimento si ferma sul confine. */
+  function agganciaTestataCompatta() {
+    var testata = document.querySelector('.testata');
+    if (!testata) return;
+    var atteso = false;
+    function valuta() {
+      atteso = false;
+      var y = window.pageYOffset || document.documentElement.scrollTop || 0;
+      var compatta = testata.classList.contains('compatta');
+      if (!compatta && y > 48) testata.classList.add('compatta');
+      else if (compatta && y < 24) testata.classList.remove('compatta');
+    }
+    window.addEventListener('scroll', function () {
+      if (atteso) return;
+      atteso = true;
+      window.requestAnimationFrame(valuta);
+    }, { passive: true });
+    valuta();
   }
 
   /* --------------------------------------------------------------- avvio */
