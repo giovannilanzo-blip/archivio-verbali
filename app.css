@@ -1,3378 +1,887 @@
-/* =====================================================================
-   app.js — Archivio dei verbali del Consiglio d'Istituto
-   Indicizzazione locale (DOCX / PDF / TXT) e ricerca per parole o frase.
-   ===================================================================== */
-(function () {
-  'use strict';
-
-  var P = window.VerbaliParser;
-  var VERSIONE_INDICE = 6;
-
-  var stato = {
-    config: null,
-    files: [],           // elenco dal server
-    indice: null,        // { versione, generato, docs: {nome: docIndicizzato} }
-    normCache: {},       // nome -> array di paragrafi normalizzati
-    cestino: [],
-    cartellaCestino: null,
-    risultati: [],
-    ultimaRicerca: null
-  };
-
-  /* ------------------------------------------------------------- utilita' */
-
-  function el(id) { return document.getElementById(id); }
-  function esc(s) { return P.escHtml(s == null ? '' : s); }
-
-  function chiediJson(url, opzioni) {
-    return fetch(url, opzioni || {}).then(function (r) {
-      return r.text().then(function (t) {
-        var dati = null;
-        try { dati = t ? JSON.parse(t) : null; } catch (e) { dati = null; }
-        if (!r.ok) {
-          var msg = (dati && dati.errore) ? dati.errore : ('HTTP ' + r.status);
-          var err = new Error(msg);
-          err.dati = dati; err.status = r.status;
-          throw err;
-        }
-        return dati;
-      });
-    });
-  }
-
-  function velo(mostra, titolo, testo, percentuale) {
-    var v = el('velo');
-    if (!mostra) { v.hidden = true; return; }
-    v.hidden = false;
-    if (titolo != null) el('velo-titolo').textContent = titolo;
-    if (testo != null) el('velo-testo').textContent = testo;
-    if (percentuale != null) el('velo-barra').style.width = Math.round(percentuale) + '%';
-  }
-
-  function attendi(ms) { return new Promise(function (r) { setTimeout(r, ms || 0); }); }
-
-  function dimensioneLeggibile(byte) {
-    var b = byte || 0;
-    if (b >= 1048576) return (b / 1048576).toFixed(1).replace('.', ',') + ' MB';
-    return Math.max(1, Math.round(b / 1024)) + ' KB';
-  }
-
-  function etichettaVerbale(d) {
-    var s = 'Verbale';
-    if (d.numero != null) s += ' n. ' + d.numero;
-    if (d.annoScolastico) s += '/' + d.annoScolastico;
-    return s;
-  }
-
-  function ordinaDocs(docs, criterio) {
-    var arr = docs.slice();
-    arr.sort(function (a, b) {
-      if (criterio === 'pertinenza') return (b._occ || 0) - (a._occ || 0);
-      var ka = a.dataISO || '', kb = b.dataISO || '';
-      if (ka !== kb) return criterio === 'cronologico' ? (ka < kb ? -1 : 1) : (ka < kb ? 1 : -1);
-      var na = a.numero == null ? -1 : a.numero, nb = b.numero == null ? -1 : b.numero;
-      return criterio === 'cronologico' ? na - nb : nb - na;
-    });
-    return arr;
-  }
-
-  /* ------------------------------------------------ estrazione del testo */
-
-  function estraiDocx(buffer) {
-    return JSZip.loadAsync(buffer).then(function (zip) {
-      var f = zip.file('word/document.xml');
-      if (!f) throw new Error('il file non contiene word/document.xml');
-      return f.async('string');
-    }).then(function (xml) {
-      return {
-        paragrafi: P.docxToParagraphs(xml),
-        presenze: P.estraiPresenze(P.docxToTabelle(xml))
-      };
-    });
-  }
-
-  function estraiPdf(buffer) {
-    return pdfjsLib.getDocument({ data: buffer, isEvalSupported: false }).promise.then(function (pdf) {
-      var pagine = [];
-      var seq = Promise.resolve();
-      for (var i = 1; i <= pdf.numPages; i++) {
-        seq = seq.then(function (n) {
-          return function () {
-            return pdf.getPage(n).then(function (page) {
-              return page.getTextContent().then(function (tc) {
-                pagine.push(tc.items.map(function (it) {
-                  return { str: it.str, x: it.transform[4], y: it.transform[5], w: it.width || 0, h: it.height || 0 };
-                }));
-              });
-            });
-          };
-        }(i));
-      }
-      return seq.then(function () {
-        return {
-          paragrafi: P.pdfItemsToParagraphs(pagine),
-          presenze: P.pdfItemsToPresenze(pagine)
-        };
-      });
-    });
-  }
-
-  function estraiTxt(buffer) {
-    var t = new TextDecoder('utf-8').decode(new Uint8Array(buffer));
-    return Promise.resolve({
-      paragrafi: t.split(/\r?\n/).map(function (r) { return { text: r.trim(), ilvl: -1, numId: -1 }; }),
-      presenze: { rilevata: false, righe: [] }
-    });
-  }
-
-  function estraiParagrafi(nome, buffer) {
-    var e = (nome.split('.').pop() || '').toLowerCase();
-    if (e === 'docx') return estraiDocx(buffer);
-    if (e === 'pdf') return estraiPdf(buffer);
-    if (e === 'txt') return estraiTxt(buffer);
-    return Promise.reject(new Error('formato non indicizzabile (' + e + ')'));
-  }
-
-  /* ------------------------------------------------------ indicizzazione */
-
-  function indicizzaFile(meta) {
-    return fetch('/api/file?nome=' + encodeURIComponent(meta.nome))
-      .then(function (r) { if (!r.ok) throw new Error('lettura non riuscita'); return r.arrayBuffer(); })
-      .then(function (buf) { return estraiParagrafi(meta.nome, buf); })
-      .then(function (estratto) {
-        var paras = estratto.paragrafi || estratto;
-        var d = P.parseVerbale(paras, meta.nome, estratto.presenze);
-        d.nome = meta.nome;
-        d.dimensione = meta.dimensione;
-        d.modificato = meta.modificato;
-        d.errore = null;
-        if (d.caratteri < 400) {
-          d.avviso = 'testo quasi assente: se si tratta di una scansione va prima applicato un riconoscimento OCR';
-        }
-        return d;
-      })
-      .catch(function (e) {
-        return {
-          nome: meta.nome, dimensione: meta.dimensione, modificato: meta.modificato,
-          errore: e.message || String(e), numero: null, annoScolastico: null,
-          dataISO: null, dataLabel: null, odg: [], sezioni: [], puntiNonLocalizzati: [],
-          presenze: { rilevata: false, righe: [] },
-          delibere: [], paragrafi: [], caratteri: 0
-        };
-      });
-  }
-
-  function daRiindicizzare(meta, forza) {
-    if (forza) return true;
-    if (!stato.indice || !stato.indice.docs) return true;
-    var vecchio = stato.indice.docs[meta.nome];
-    if (!vecchio) return true;
-    if (vecchio.dimensione !== meta.dimensione) return true;
-    if (vecchio.modificato !== meta.modificato) return true;
-    return false;
-  }
-
-  function costruisciIndice(forza) {
-    return chiediJson('/api/list').then(function (r) {
-      stato.files = (r && r.files) ? r.files : [];
-      if (!stato.indice || stato.indice.versione !== VERSIONE_INDICE || forza) {
-        stato.indice = { versione: VERSIONE_INDICE, generato: null, docs: {} };
-      }
-
-      var daFare = stato.files.filter(function (f) { return daRiindicizzare(f, forza); });
-      var presenti = {};
-      stato.files.forEach(function (f) { presenti[f.nome] = true; });
-      // rimuove dall'indice i file non piu' presenti nella cartella
-      Object.keys(stato.indice.docs).forEach(function (n) {
-        if (!presenti[n]) { delete stato.indice.docs[n]; delete stato.normCache[n]; }
-      });
-
-      if (!daFare.length) { aggiornaStato(); return Promise.resolve(0); }
-
-      velo(true, 'Indicizzazione dei verbali', '', 0);
-      var fatti = 0;
-      var seq = Promise.resolve();
-      daFare.forEach(function (meta) {
-        seq = seq.then(function () {
-          velo(true, 'Indicizzazione dei verbali', meta.nome, (fatti / daFare.length) * 100);
-          return attendi(10).then(function () { return indicizzaFile(meta); }).then(function (d) {
-            stato.indice.docs[meta.nome] = d;
-            delete stato.normCache[meta.nome];
-            fatti++;
-            velo(true, 'Indicizzazione dei verbali', meta.nome, (fatti / daFare.length) * 100);
-          });
-        });
-      });
-
-      return seq.then(function () {
-        stato.indice.generato = new Date().toISOString();
-        return salvaIndice();
-      }).then(function () {
-        velo(false);
-        return daFare.length;
-      });
-    });
-  }
-
-  function salvaIndice() {
-    return chiediJson('/api/indice', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(stato.indice)
-    }).catch(function (e) {
-      console.warn('indice non salvato:', e.message);
-    });
-  }
-
-  function docs() {
-    if (!stato.indice || !stato.indice.docs) return [];
-    return Object.keys(stato.indice.docs).map(function (k) { return stato.indice.docs[k]; });
-  }
-
-  function paragrafiNormalizzati(d) {
-    if (!stato.normCache[d.nome]) {
-      stato.normCache[d.nome] = d.paragrafi.map(function (p) { return P.norm(p.t); });
-    }
-    return stato.normCache[d.nome];
-  }
-
-  /* -------------------------------------------------------------- ricerca */
-
-  /* ==================================================================
-     PRESENZE DEI COMPONENTI E ALLARMI PER ASSENZE CONSECUTIVE
-     ================================================================== */
-
-  var VERSIONE_PRESENZE = 1;
-
-  function chiaveNome(n) { return P.norm(n).replace(/[^a-z0-9]+/g, ' ').trim(); }
-
-  /* Nominativi esclusi dal monitoraggio delle presenze fin dalla prima
-     installazione: componenti decaduti dalla carica in epoca anteriore
-     all'archivio, dei quali non si vuole traccia fra gli avvisi. Il
-     riconoscimento avviene per cognome, ignorando accenti e maiuscole, poiché
-     la grafia con cui compaiono nei verbali non è nota a priori. L'elenco
-     resta visibile e modificabile nella scheda Presenze. */
-  /* Nella versione pubblicata su GitHub Pages il codice è pubblico: i
-     nominativi esclusi risiedono soltanto in dati/presenze.json, nel
-     repository privato, dove erano già stati registrati. */
-  var ESCLUSI_PREDEFINITI = [];
-
-  /* Data di inizio del monitoraggio delle presenze. Le sedute anteriori
-     restano indicizzate, ricercabili e consultabili in ogni loro parte: sono
-     escluse soltanto dal prospetto, dai conteggi delle assenze consecutive e
-     dagli avvisi in apertura. Serve quando l'archivio comprende sedute di una
-     consiliatura anteriore, i cui componenti non sono quelli attuali, e
-     realizza lo scopo per il quale si sarebbe altrimenti dovuto cancellare
-     quei verbali, senza perderne il contenuto.
-     Il valore viene immesso una sola volta nei dati salvati, per mezzo
-     dell'indicatore inizioInizializzato: se l'utente lo rimuove, la rimozione
-     non viene annullata al caricamento successivo. */
-  var DATA_INIZIO_PREDEFINITA = '2025-12-18';
-
-  function statoPresenze() {
-    if (!stato.presenzeDati) {
-      stato.presenzeDati = { versione: VERSIONE_PRESENZE };
-    }
-    var s = stato.presenzeDati;
-    if (!s.correzioni) s.correzioni = {};
-    if (!s.decadenze) s.decadenze = {};
-    if (!s.silenziati) s.silenziati = {};
-    if (!s.cessati) s.cessati = {};
-    if (!s.esclusi) s.esclusi = [];
-    if (!s.esclusiInizializzati) {
-      ESCLUSI_PREDEFINITI.forEach(function (e) {
-        var gia = s.esclusi.some(function (x) { return x.pattern === e.pattern; });
-        if (!gia) s.esclusi.push({ pattern: e.pattern, etichetta: e.etichetta, predefinito: true });
-      });
-      s.esclusiInizializzati = true;
-    }
-    if (!s.inizioInizializzato) {
-      if (DATA_INIZIO_PREDEFINITA && !s.dataInizio) {
-        s.dataInizio = DATA_INIZIO_PREDEFINITA;
-        s.dataInizioLabel = itData(DATA_INIZIO_PREDEFINITA);
-      }
-      s.inizioInizializzato = true;
-    }
-    return s;
-  }
-
-  /* Data di inizio del monitoraggio, quando ne sia stata fissata una valida. */
-  function inizioMonitoraggio() {
-    var d = statoPresenze().dataInizio;
-    return (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) ? d : null;
-  }
-
-  /* Vero se il nominativo corrisponde a uno degli esclusi. Il confronto è per
-     parole intere consecutive, così un cognome composto non intercetta un cognome più lungo che lo contiene. */
-  function nominativoEscluso(nome) {
-    var parole = chiaveNome(nome).split(' ').filter(Boolean);
-    if (!parole.length) return false;
-    return statoPresenze().esclusi.some(function (e) {
-      var p = String(e.pattern || '').split(' ').filter(Boolean);
-      if (!p.length) return false;
-      for (var i = 0; i + p.length <= parole.length; i++) {
-        var ok = true;
-        for (var j = 0; j < p.length; j++) {
-          if (parole[i + j] !== p[j]) { ok = false; break; }
-        }
-        if (ok) return true;
-      }
-      return false;
-    });
-  }
-
-  function salvaPresenze() {
-    return chiediJson('/api/presenze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(statoPresenze())
-    }).catch(function (e) { console.warn('presenze non salvate:', e.message); });
-  }
-
-  /* Sedute in ordine cronologico, dalla più antica alla più recente. Le
-     assenze consecutive hanno senso soltanto su una successione ordinata. */
-  function seduteTutte() {
-    return docs().filter(function (d) { return !d.errore; })
-      .sort(function (a, b) {
-        var ka = a.dataISO || '', kb = b.dataISO || '';
-        if (ka !== kb) return ka < kb ? -1 : 1;
-        return (a.numero == null ? 0 : a.numero) - (b.numero == null ? 0 : b.numero);
-      });
-  }
-
-  /* Le sole sedute che il monitoraggio prende in considerazione. Un verbale
-     privo di data riconosciuta non può essere collocato nella successione e
-     viene conservato, poiché escluderlo in silenzio ne farebbe perdere le
-     presenze senza che l'utente ne sia avvertito: la scheda Presenze segnala
-     separatamente i verbali in questa condizione. */
-  function seduteOrdinate() {
-    var inizio = inizioMonitoraggio();
-    if (!inizio) return seduteTutte();
-    return seduteTutte().filter(function (d) {
-      return !d.dataISO || d.dataISO >= inizio;
-    });
-  }
-
-  /* Sedute lasciate fuori dalla data di inizio del monitoraggio. */
-  function seduteAnteriori() {
-    var inizio = inizioMonitoraggio();
-    if (!inizio) return [];
-    return seduteTutte().filter(function (d) {
-      return d.dataISO && d.dataISO < inizio;
-    });
-  }
-
-  /* Stato di un componente in una seduta, tenuto conto delle correzioni
-     manuali: 'presente', 'assente', oppure null se non risulta in carica. */
-  function statoIn(doc, chiave) {
-    /* La cessazione dal mandato ha una decorrenza: le sedute successive non
-       riguardano più il componente, quelle anteriori conservano il dato che i
-       verbali documentano. */
-    var cess = statoPresenze().cessati[chiave];
-    if (cess && cess.data && doc.dataISO && doc.dataISO >= cess.data) return null;
-
-    var corr = statoPresenze().correzioni[doc.nome + '||' + chiave];
-    if (corr) return corr === 'assente' ? 'assente' : (corr === 'presente' ? 'presente' : null);
-    var righe = (doc.presenze && doc.presenze.righe) ? doc.presenze.righe : [];
-    for (var i = 0; i < righe.length; i++) {
-      if (chiaveNome(righe[i].nome) === chiave) {
-        return righe[i].stato === 'assente' ? 'assente' : (righe[i].stato === 'presente' ? 'presente' : null);
-      }
-    }
-    return null;
-  }
-
-  /* Prospetto completo: per ciascun componente la successione degli stati,
-     la serie di assenze consecutive in corso e il livello di allarme. */
-  function calcolaPresenze() {
-    var sedute = seduteOrdinate();
-    var conTabella = sedute.filter(function (d) { return d.presenze && d.presenze.rilevata; });
-
-    // elenco dei componenti: unione dei nominativi rilevati, più quelli
-    // introdotti dalle correzioni manuali
-    var membri = {};
-    function registra(nome) {
-      var k = chiaveNome(nome);
-      if (!k) return null;
-      // gli esclusi non vengono nemmeno registrati: non compaiono in alcun
-      // punto del monitoraggio, né fra gli avvisi né nel prospetto
-      if (nominativoEscluso(nome)) return null;
-      if (!membri[k]) membri[k] = { chiave: k, nome: nome, ruolo: '', stati: {}, note: {} };
-      return membri[k];
-    }
-    sedute.forEach(function (d) {
-      ((d.presenze && d.presenze.righe) || []).forEach(function (r) {
-        var m = registra(r.nome);
-        if (m && r.ruolo && !m.ruolo) m.ruolo = r.ruolo;
-        if (m && r.nota) m.note[d.nome] = r.nota;
-      });
-    });
-    Object.keys(statoPresenze().correzioni).forEach(function (k) {
-      var p = k.split('||');
-      if (p.length === 2 && nominativoEscluso(p[1])) return;
-      if (p.length === 2 && membri[p[1]] === undefined) {
-        // una correzione può riguardare un componente non rilevato in alcuna
-        // tabella: se ne conserva il nominativo così come memorizzato
-        membri[p[1]] = { chiave: p[1], nome: p[1], ruolo: '', stati: {}, note: {} };
-      }
-    });
-
-    var ultima = conTabella.length ? conTabella[conTabella.length - 1] : null;
-
-    var elenco = Object.keys(membri).map(function (k) { return membri[k]; });
-    elenco.forEach(function (m) {
-      var serie = 0, serieMax = 0, ultimaAssenza = null, totAssenze = 0, totPresenze = 0;
-      var primaDellaSerie = null, sedutaRosso = null, serieRossa = [];
-      var correnti = [];
-      sedute.forEach(function (d) {
-        var st = statoIn(d, m.chiave);
-        m.stati[d.nome] = st;
-        if (st === 'assente') {
-          if (serie === 0) { primaDellaSerie = d; correnti = []; }
-          serie++;
-          correnti.push(d);
-          totAssenze++;
-          ultimaAssenza = d;
-          if (serie > serieMax) serieMax = serie;
-          if (serie === 3 && !sedutaRosso) { sedutaRosso = d; serieRossa = correnti.slice(); }
-        } else if (st === 'presente') {
-          serie = 0;
-          primaDellaSerie = null;
-          correnti = [];
-          totPresenze++;
-        }
-      });
-      m.serie = serie;
-      m.serieMax = serieMax;
-      m.totAssenze = totAssenze;
-      m.totPresenze = totPresenze;
-      m.ultimaAssenza = ultimaAssenza;
-      m.primaDellaSerie = primaDellaSerie;
-      m.sedutaRosso = sedutaRosso;
-      m.serieRossa = serieRossa;
-      m.cessato = statoPresenze().cessati[m.chiave] || null;
-      m.inCarica = m.cessato ? false : (ultima ? statoIn(ultima, m.chiave) !== null : false);
-      m.decadenza = statoPresenze().decadenze[m.chiave] || null;
-      m.silenziato = !!statoPresenze().silenziati[m.chiave];
-
-      /* L'avviso arancione cessa da sé non appena il componente risulta
-         presente in una seduta successiva, poiché la serie riparte da zero.
-         L'avviso rosso, una volta raggiunte tre assenze consecutive, permane
-         anche se il componente torna a presentarsi: si chiude soltanto con la
-         registrazione della delibera di decadenza, oppure si tace a mano. */
-      if (m.cessato) m.livello = 'cessato';
-      else if (m.decadenza) m.livello = 'chiuso';
-      else if (serieMax > 2) m.livello = 'rosso';
-      else if (serie === 2) m.livello = 'arancione';
-      else m.livello = 'nessuno';
-
-      // lampeggia in apertura soltanto se il componente risulta ancora in
-      // carica e l'avviso non è stato silenziato a mano
-      m.lampeggia = (m.livello === 'rosso' || m.livello === 'arancione') &&
-                    m.inCarica && !m.silenziato;
-    });
-
-    elenco.sort(function (a, b) {
-      var ord = { rosso: 0, arancione: 1, nessuno: 2, chiuso: 3, cessato: 4 };
-      if (ord[a.livello] !== ord[b.livello]) return ord[a.livello] - ord[b.livello];
-      if (b.serie !== a.serie) return b.serie - a.serie;
-      return a.nome.localeCompare(b.nome, 'it');
-    });
-
-    return {
-      sedute: sedute,
-      dataInizio: inizioMonitoraggio(),
-      anteriori: seduteAnteriori(),
-      conTabella: conTabella,
-      senzaTabella: sedute.filter(function (d) { return !(d.presenze && d.presenze.rilevata); }),
-      membri: elenco,
-      attuali: elenco.filter(function (m) { return !m.cessato; }),
-      cessati: elenco.filter(function (m) { return !!m.cessato; }),
-      ultima: ultima,
-      allarmi: elenco.filter(function (m) { return m.lampeggia; }),
-      sospesi: elenco.filter(function (m) {
-        return (m.livello === 'rosso' || m.livello === 'arancione') && !m.lampeggia;
-      })
-    };
-  }
-
-  /* ------------------------------------------------ ricerca per numero */
-
-  /* Riconosce nel testo digitato i riferimenti a un verbale o a una delibera.
-     Sono ammesse le forme "10", "verbale 10", "v10", "delibera 96",
-     "d 96/2025-26", anche piu' d'una nella medesima interrogazione. Un numero
-     privo di qualificazione viene cercato come verbale e come delibera. */
-  function analizzaNumero(qRaw) {
-    var n = P.norm(qRaw).replace(/\bn[.°*]?\s*(?=\d)/g, '').replace(/\s+/g, ' ').trim();
-    if (!n) return [];
-
-    var VERB = /^(verbale|verbali|verb|vrb|v)$/;
-    var DELIB = /^(delibera|delibere|delib|del|d)$/;
-    var NUM = /^(\d{1,4})(?:\/(\d{4}[-\/]\d{2,4}))?$/;
-    var NUM_ATTACCATO = /^(verbale|verb|v|delibera|delib|del|d)\.?(\d{1,4})(?:\/(\d{4}[-\/]\d{2,4}))?$/;
-
-    var tok = n.split(' ');
-    var richieste = [], i = 0;
-
-    function aggiungi(tipo, numero, anno) {
-      if (!numero) return;
-      richieste.push({ tipo: tipo, numero: parseInt(numero, 10), anno: anno || null });
-    }
-
-    while (i < tok.length) {
-      var t = tok[i];
-      var m;
-
-      if (VERB.test(t) || DELIB.test(t)) {
-        var tipo = VERB.test(t) ? 'verbale' : 'delibera';
-        m = NUM.exec(tok[i + 1] || '');
-        if (m) { aggiungi(tipo, m[1], m[2]); i += 2; continue; }
-        i++; continue;
-      }
-
-      m = NUM_ATTACCATO.exec(t);
-      if (m) {
-        aggiungi(/^(v|vrb|verb|verbale)$/.test(m[1]) ? 'verbale' : 'delibera', m[2], m[3]);
-        i++; continue;
-      }
-
-      m = NUM.exec(t);
-      if (m) { aggiungi('entrambi', m[1], m[2]); i++; continue; }
-
-      i++;
-    }
-    return richieste;
-  }
-
-  function stessoAnno(a, b) {
-    if (!a || !b) return true;
-    return P.norm(a).replace(/[^0-9]/g, '') === P.norm(b).replace(/[^0-9]/g, '');
-  }
-
-  function cercaPerNumero(q) {
-    var richieste = analizzaNumero(q);
-    var esiti = { verbali: [], delibere: [], richieste: richieste };
-    if (!richieste.length) return esiti;
-
-    var visti = {};
-    richieste.forEach(function (r) {
-      if (r.tipo === 'verbale' || r.tipo === 'entrambi') {
-        docs().forEach(function (d) {
-          if (d.errore || d.numero !== r.numero) return;
-          if (!stessoAnno(r.anno, d.annoScolastico)) return;
-          if (visti['v' + d.nome]) return;
-          visti['v' + d.nome] = true;
-          esiti.verbali.push(d);
-        });
-      }
-      if (r.tipo === 'delibera' || r.tipo === 'entrambi') {
-        docs().forEach(function (d) {
-          if (d.errore) return;
-          d.sezioni.forEach(function (s, si) {
-            (s.dettaglioDelibere || []).forEach(function (del) {
-              if (del.numero !== r.numero) return;
-              if (!stessoAnno(r.anno, del.anno)) return;
-              var chiave = 'd' + d.nome + '#' + si + '#' + del.id;
-              if (visti[chiave]) return;
-              visti[chiave] = true;
-              esiti.delibere.push({ doc: d, sezione: s, sezioneIdx: si, delibera: del });
-            });
-          });
-        });
-      }
-    });
-
-    esiti.verbali = ordinaDocs(esiti.verbali, 'recenti');
-    esiti.delibere.sort(function (a, b) {
-      var ka = a.doc.dataISO || '', kb = b.doc.dataISO || '';
-      if (ka !== kb) return ka < kb ? 1 : -1;
-      return b.delibera.numero - a.delibera.numero;
-    });
-    return esiti;
-  }
-
-  /* -------------------------------------------------- ricerca per data */
-
-  function pad2(n) { return (n < 10 ? '0' : '') + n; }
-  function giorniDelMese(anno, mese) { return new Date(anno, mese, 0).getDate(); }
-
-  /* Ogni espressione di data viene convertita nell'intervallo che essa
-     designa: un giorno singolo, un mese intero, un anno solare o un anno
-     scolastico, che si assume compreso fra il 1 settembre e il 31 agosto. */
-  function intervalloDa(espr) {
-    var a = espr.anno, m = espr.mese, g = espr.giorno;
-    if (espr.tipo === 'as') {
-      return { da: a + '-09-01', a: (a + 1) + '-08-31' };
-    }
-    if (g) return { da: a + '-' + pad2(m) + '-' + pad2(g), a: a + '-' + pad2(m) + '-' + pad2(g) };
-    if (m) return { da: a + '-' + pad2(m) + '-01', a: a + '-' + pad2(m) + '-' + pad2(giorniDelMese(a, m)) };
-    return { da: a + '-01-01', a: a + '-12-31' };
-  }
-
-  function analizzaData(qRaw) {
-    var n = P.norm(qRaw)
-      .replace(/\ba\.?\s*s\.?\s*/g, 'as ')
-      .replace(/\s+/g, ' ').trim();
-    if (!n) return null;
-
-    var MESI = P.mesi;
-    var espressioni = [];
-
-    // anno scolastico: "as 2025/26", "2025/26", "2025-26"
-    var reAS = /(?:as\s*)?(\d{4})\s*[\/-]\s*(\d{2,4})(?![\d\/-])/g, m;
-    var consumato = n;
-    while ((m = reAS.exec(n)) !== null) {
-      var a1 = parseInt(m[1], 10);
-      var secondo = m[2].length === 2 ? (Math.floor(a1 / 100) * 100 + parseInt(m[2], 10)) : parseInt(m[2], 10);
-      if (secondo === a1 + 1 && a1 >= 1990 && a1 <= 2100) {
-        espressioni.push({ tipo: 'as', anno: a1, testo: m[0] });
-        consumato = consumato.replace(m[0], ' ');
-      }
-    }
-
-    // giorno numerico: 23/04/2026, 23-4-2026, 23.04.2026
-    var reGG = /(\d{1,2})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(\d{4})/g;
-    while ((m = reGG.exec(consumato)) !== null) {
-      var gg = +m[1], mm = +m[2], aa = +m[3];
-      if (gg >= 1 && gg <= 31 && mm >= 1 && mm <= 12) {
-        espressioni.push({ tipo: 'giorno', giorno: gg, mese: mm, anno: aa, testo: m[0] });
-      }
-    }
-    consumato = consumato.replace(reGG, ' ');
-
-    // giorno con mese in lettere: "23 aprile 2026"
-    var reGGM = new RegExp('(\\d{1,2})\\s+(' + MESI.join('|') + ')\\s+(\\d{4})', 'g');
-    while ((m = reGGM.exec(consumato)) !== null) {
-      espressioni.push({ tipo: 'giorno', giorno: +m[1], mese: MESI.indexOf(m[2]) + 1, anno: +m[3], testo: m[0] });
-    }
-    consumato = consumato.replace(reGGM, ' ');
-
-    // mese in lettere con anno: "aprile 2026"
-    var reM = new RegExp('(' + MESI.join('|') + ')\\s+(\\d{4})', 'g');
-    while ((m = reM.exec(consumato)) !== null) {
-      espressioni.push({ tipo: 'mese', mese: MESI.indexOf(m[1]) + 1, anno: +m[2], testo: m[0] });
-    }
-    consumato = consumato.replace(reM, ' ');
-
-    // mese numerico con anno: "04/2026"
-    var reMN = /(\d{1,2})\s*[\/.-]\s*(\d{4})/g;
-    while ((m = reMN.exec(consumato)) !== null) {
-      if (+m[1] >= 1 && +m[1] <= 12) espressioni.push({ tipo: 'mese', mese: +m[1], anno: +m[2], testo: m[0] });
-    }
-    consumato = consumato.replace(reMN, ' ');
-
-    // anno solare isolato
-    var reA = /(?:^|\s)(\d{4})(?:\s|$)/g;
-    while ((m = reA.exec(consumato)) !== null) {
-      var y = +m[1];
-      if (y >= 1990 && y <= 2100) espressioni.push({ tipo: 'anno', anno: y, testo: m[1] });
-    }
-
-    if (!espressioni.length) return null;
-
-    var intervalli = espressioni.map(intervalloDa);
-    // "dal ... al ...": due estremi si fondono in un unico intervallo
-    var haCongiunzione = /\b(dal|da|al|a|fra|tra)\b/.test(n) || /\d\s*-\s*\d/.test(n);
-    if (intervalli.length === 2 && haCongiunzione) {
-      var da = intervalli[0].da < intervalli[1].da ? intervalli[0].da : intervalli[1].da;
-      var aFin = intervalli[0].a > intervalli[1].a ? intervalli[0].a : intervalli[1].a;
-      intervalli = [{ da: da, a: aFin }];
-      espressioni = [{ tipo: 'intervallo' }];
-    }
-    return { espressioni: espressioni, intervalli: intervalli, descrizione: descriviIntervalli(intervalli) };
-  }
-
-  function itData(iso) {
-    if (!iso) return '—';
-    var p = iso.split('-');
-    return p[2] + '/' + p[1] + '/' + p[0];
-  }
-
-  function descriviIntervalli(intervalli) {
-    return intervalli.map(function (iv) {
-      if (iv.da === iv.a) return 'del ' + itData(iv.da);
-      return 'dal ' + itData(iv.da) + ' al ' + itData(iv.a);
-    }).join(' e ');
-  }
-
-  function cercaPerData(q) {
-    var an = analizzaData(q);
-    if (!an) return { verbali: [], analisi: null, senzaData: 0 };
-    var trovati = [], visti = {}, senzaData = 0;
-    docs().forEach(function (d) {
-      if (d.errore) return;
-      if (!d.dataISO) { senzaData++; return; }
-      var dentro = an.intervalli.some(function (iv) { return d.dataISO >= iv.da && d.dataISO <= iv.a; });
-      if (dentro && !visti[d.nome]) { visti[d.nome] = true; trovati.push(d); }
-    });
-    return { verbali: ordinaDocs(trovati, 'recenti'), analisi: an, senzaData: senzaData };
-  }
-
-  function disegnaEsitiData(ricerca) {
-    var v = el('vista-risultati');
-    var e = ricerca.esiti;
-
-    if (!e.analisi) {
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessuna data riconosciuta</span>' +
-        'Vanno digitate forme quali «23/04/2026», «23 aprile 2026», «aprile 2026», «2026», ' +
-        '«a.s. 2025/26», «dal 01/01/2026 al 30/06/2026».</div>';
-      return;
-    }
-
-    if (!e.verbali.length) {
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessuna seduta</span>' +
-        'Nell\'archivio non risultano verbali ' + esc(e.analisi.descrizione) + '.' +
-        (e.senzaData ? '<br>' + e.senzaData + (e.senzaData === 1 ? ' verbale non ha' : ' verbali non hanno') +
-          ' una data rilevata e resta escluso da questa ricerca: si veda la scheda Diagnostica.' : '') +
-        '</div>';
-      return;
-    }
-
-    var h = '<div class="riepilogo"><strong>' + e.verbali.length + '</strong> ' +
-      (e.verbali.length === 1 ? 'seduta' : 'sedute') + ' ' + esc(e.analisi.descrizione) + '.' +
-      (e.senzaData ? ' <span style="color:var(--allerta)">' + e.senzaData +
-        (e.senzaData === 1 ? ' verbale è escluso' : ' verbali sono esclusi') +
-        ' perché privi di data rilevata.</span>' : '') + '</div>';
-    e.verbali.forEach(function (d) { h += schedaVerbaleCompleto(d); });
-    v.innerHTML = h;
-  }
-
-  /* ------------------------------------------------------------- ricerca */
-
-  function cerca() {
-    var q = el('q').value.trim();
-    var modo = document.querySelector('input[name=modo]:checked').value;
-    var prefisso = el('opt-prefisso').checked;
-    var ambito = el('opt-ambito').value;
-    var ordine = el('opt-ordine').value;
-    var soloDelibere = el('opt-solo-delibere').checked;
-
-    el('btn-pulisci').hidden = !q;
-    el('avviso-modo').textContent = '';
-
-    if (!q) { stato.risultati = []; stato.ultimaRicerca = null; disegnaRisultati(null); return; }
-
-    if (modo === 'numero') {
-      var esitiNum = cercaPerNumero(q);
-      stato.risultati = [];
-      stato.ultimaRicerca = { q: q, modo: 'numero', esiti: esitiNum };
-      if (!esitiNum.richieste.length) {
-        el('avviso-modo').textContent = 'Non è stato riconosciuto alcun numero. Vanno digitate forme quali «10», «verbale 10», «delibera 96».';
-      }
-      disegnaEsitiNumero(stato.ultimaRicerca);
-      return;
-    }
-
-    if (modo === 'data') {
-      var esitiData = cercaPerData(q);
-      stato.risultati = [];
-      stato.ultimaRicerca = { q: q, modo: 'data', esiti: esitiData };
-      if (!esitiData.analisi) {
-        el('avviso-modo').textContent = 'Non è stata riconosciuta alcuna data. Vanno digitate forme quali «23/04/2026», «aprile 2026», «2026».';
-      }
-      disegnaEsitiData(stato.ultimaRicerca);
-      return;
-    }
-
-    var termini = P.norm(q).split(/\s+/).filter(Boolean);
-    if (modo === 'parole' && termini.length > 3) {
-      el('avviso-modo').textContent = 'Sono stati indicati ' + termini.length +
-        ' termini: la ricerca per parole è pensata per un massimo di tre. Vengono usati i primi cinque.';
-    }
-
-    var matchers = P.buildMatchers(q, modo, prefisso);
-    if (!matchers || !matchers.length) { stato.risultati = []; disegnaRisultati(null); return; }
-    var singoli = modo === 'frase' ? matchers : termini.map(function (t) { return P.buildMatchers(t, 'frase', prefisso)[0]; });
-
-    var gruppi = [];
-    docs().forEach(function (d) {
-      if (d.errore || !d.paragrafi.length) return;
-      var nrm = paragrafiNormalizzati(d);
-      var perSezione = {};
-
-      function aggiungi(si, idxPar, occ) {
-        var k = String(si);
-        if (!perSezione[k]) perSezione[k] = { sezione: si, occorrenze: 0, paragrafi: [] };
-        perSezione[k].occorrenze += occ;
-        perSezione[k].paragrafi.push(idxPar);
-      }
-
-      if (ambito === 'paragrafo') {
-        for (var i = 0; i < nrm.length; i++) {
-          var occ = P.testParagrafo(nrm[i], matchers);
-          if (occ) aggiungi(d.paragrafi[i].s, i, occ);
-        }
-      } else {
-        // raggruppa gli indici dei paragrafi per ambito
-        var chiavi = {};
-        for (var j = 0; j < d.paragrafi.length; j++) {
-          var ch = ambito === 'verbale' ? '*' : String(d.paragrafi[j].s);
-          if (!chiavi[ch]) chiavi[ch] = [];
-          chiavi[ch].push(j);
-        }
-        Object.keys(chiavi).forEach(function (ch) {
-          var lista = chiavi[ch];
-          var trovatiPerTermine = singoli.map(function () { return []; });
-          lista.forEach(function (idx) {
-            singoli.forEach(function (m, k) {
-              if (P.testParagrafo(nrm[idx], [m])) trovatiPerTermine[k].push(idx);
-            });
-          });
-          var completo = trovatiPerTermine.every(function (a) { return a.length > 0; });
-          if (!completo) return;
-          var unione = {}, tot = 0;
-          trovatiPerTermine.forEach(function (a) {
-            a.forEach(function (idx) { if (!unione[idx]) { unione[idx] = true; tot++; } });
-          });
-          Object.keys(unione).map(Number).sort(function (a, b) { return a - b; }).forEach(function (idx) {
-            var si = ambito === 'verbale' ? d.paragrafi[idx].s : parseInt(ch, 10);
-            aggiungi(si, idx, 1);
-          });
-        });
-      }
-
-      var chiaviSez = Object.keys(perSezione);
-      if (!chiaviSez.length) return;
-
-      var voci = [];
-      chiaviSez.forEach(function (k) {
-        var g = perSezione[k];
-        var sez = (g.sezione >= 0 && d.sezioni[g.sezione]) ? d.sezioni[g.sezione] : null;
-        if (soloDelibere && (!sez || !sez.delibere || !sez.delibere.length)) return;
-        voci.push({ doc: d, sezione: sez, sezioneIdx: g.sezione, occorrenze: g.occorrenze, paragrafi: g.paragrafi });
-      });
-      if (!voci.length) return;
-
-      var totDoc = voci.reduce(function (a, v) { return a + v.occorrenze; }, 0);
-      d._occ = totDoc;
-      // i punti all'ordine del giorno precedono le parti accessorie
-      voci.sort(function (a, b) {
-        var pa = (a.sezione && a.sezione.punto) ? 0 : 1;
-        var pb = (b.sezione && b.sezione.punto) ? 0 : 1;
-        if (pa !== pb) return pa - pb;
-        return a.paragrafi[0] - b.paragrafi[0];
-      });
-      gruppi.push({ doc: d, occorrenze: totDoc, voci: voci });
-    });
-
-    var ordinati = ordinaDocs(gruppi.map(function (g) { return g.doc; }), ordine);
-    var mappa = {};
-    gruppi.forEach(function (g) { mappa[g.doc.nome] = g; });
-    stato.risultati = ordinati.map(function (d) { return mappa[d.nome]; });
-    stato.ultimaRicerca = {
-      q: q, modo: modo, prefisso: prefisso, ambito: ambito,
-      matchers: matchers, singoli: singoli
-    };
-    disegnaRisultati(stato.ultimaRicerca);
-  }
-
-  /* ------------------------------------------------------ resa risultati */
-
-  function tagSezione(sez) {
-    var h = '';
-    if (sez && sez.punto) h += '<span class="tag punto">punto ' + esc(sez.punto) + ' o.d.g.</span>';
-    else h += '<span class="tag">parte accessoria</span>';
-    if (sez && sez.delibere) {
-      sez.delibere.forEach(function (d) {
-        h += '<span class="tag delibera">delibera n. ' + esc(d) + '</span>';
-      });
-    }
-    if (sez && sez.esiti) {
-      sez.esiti.forEach(function (e) {
-        if (e === 'deliberato') return;
-        h += '<span class="tag esito">' + esc(e) + '</span>';
-      });
-    }
-    return h;
-  }
-
-  /* ------------------------------------- resa degli esiti per numero */
-
-  var RE_FORMULA = /^(delibera|il consiglio d[i'’]istituto|il consiglio di istituto|delibera:)\s*$/i;
-  var RE_PREMESSA_RIGA = /^(vist[aoie]|visionat|considerat|preso atto|presa d|premesso|richiamat|sentit|udit|accertat|tenuto conto|ritenut|rilevat|acquisit|esaminat|dato atto|verificat)/i;
-
-  function formattaTestoDelibera(testo) {
-    if (!testo) return '<p><em>Testo non disponibile.</em></p>';
-    return testo.split('\n').map(function (riga) {
-      var t = riga.trim();
-      if (!t) return '';
-      if (RE_FORMULA.test(t)) return '<p class="formula">' + esc(t) + '</p>';
-      if (RE_PREMESSA_RIGA.test(t)) return '<p class="premessa">' + esc(t) + '</p>';
-      return '<p>' + esc(t) + '</p>';
-    }).join('');
-  }
-
-  /* Comandi comuni alle schede di un atto. Il primo argomento e' il nome
-     del file, il secondo l'eventuale comando che aggiunge l'atto alla
-     raccolta da condividere. */
-  function azioniFile(nome, raccolta) {
-    return '<div class="azioni-punto">' + (raccolta || '') +
-      '<button class="bottone minuto" data-apri="' + esc(nome) + '">Apri il verbale</button>' +
-      '<button class="bottone minuto" data-cartella="' + esc(nome) + '">Mostra su GitHub</button></div>';
-  }
-
-  function schedaVerbaleCompleto(d) {
-    var h = '<div class="scheda-numero">';
-    h += '<div class="titolo-atto">' + esc(etichettaVerbale(d)) + '</div>';
-    h += '<div class="sottotitolo-atto">' +
-      (d.dataLabel ? 'Seduta del ' + esc(d.dataLabel) : 'Data non rilevata') +
-      ' · ' + d.sezioni.filter(function (s) { return s.punto; }).length + ' punti all\'ordine del giorno' +
-      ' · ' + (d.delibere || []).length + (d.delibere.length === 1 ? ' delibera adottata' : ' delibere adottate') +
-      '</div>';
-
-    if (!d.odg.length) {
-      h += '<p><em>L\'ordine del giorno non è stato riconosciuto in questo verbale. Il testo resta comunque ricercabile.</em></p>';
-    } else {
-      // ai punti dell'o.d.g. si associano le delibere rilevate nella trattazione
-      var perPunto = {};
-      d.sezioni.forEach(function (s) { if (s.punto) perPunto[s.punto] = s; });
-
-      h += '<ul class="odg-elenco">';
-      d.odg.forEach(function (it) {
-        var s = perPunto[it.num];
-        h += '<li' + (it.level > 0 ? ' class="sotto"' : '') + '>';
-        h += '<span class="num-punto">' + esc(it.num) + '.</span>';
-        h += '<span class="testo-punto">' + esc(it.titolo);
-        if (s) {
-          (s.delibere || []).forEach(function (num) {
-            h += ' <span class="tag delibera">delibera n. ' + esc(num) + '</span>';
-          });
-          (s.esiti || []).forEach(function (e) {
-            if (e === 'deliberato') return;
-            h += ' <span class="tag esito">' + esc(e) + '</span>';
-          });
-        } else if (it.level === 0) {
-          h += ' <span class="tag">trattazione non individuata</span>';
-        }
-        h += '</span></li>';
-      });
-      h += '</ul>';
-    }
-    h += azioniFile(d.nome,
-      '<button class="bottone minuto rilievo" data-raccogli-odg="' + esc(d.nome) +
-      '">Aggiungi l\'ordine del giorno alla raccolta</button>');
-    return h + '</div>';
-  }
-
-  function schedaDelibera(voce) {
-    var d = voce.doc, s = voce.sezione, del = voce.delibera;
-    var h = '<div class="scheda-numero">';
-    h += '<div class="titolo-atto">Delibera n. ' + esc(del.id) + '</div>';
-    h += '<div class="sottotitolo-atto">' + esc(etichettaVerbale(d)) +
-      (d.dataLabel ? ' · seduta del ' + esc(d.dataLabel) : '') +
-      (s.punto ? ' · punto ' + esc(s.punto) + ' all\'ordine del giorno' : '') + '</div>';
-    if (s.titolo) {
-      h += '<div class="punto-riga1"><span class="tag punto">oggetto</span>' +
-        '<span class="punto-titolo" style="font-size:14.5px">' + esc(s.titolo) + '</span></div>';
-    }
-    h += '<div class="testo-delibera">' + formattaTestoDelibera(del.testo) + '</div>';
-    h += azioniFile(d.nome,
-      '<button class="bottone minuto rilievo" data-raccogli-delibera="' + esc(d.nome) +
-      '" data-sez="' + voce.sezioneIdx + '" data-delibera="' + esc(del.id) +
-      '">Aggiungi la delibera alla raccolta</button>');
-    return h + '</div>';
-  }
-
-  function disegnaEsitiNumero(ricerca) {
-    var v = el('vista-risultati');
-    var e = ricerca.esiti;
-
-    if (!e.richieste.length) {
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessun numero riconosciuto</span>' +
-        'In questa modalità va digitato un numero. Sono ammesse le forme «10», «verbale 10», ' +
-        '«delibera 96», «d 96/2025-26».</div>';
-      return;
-    }
-
-    if (!e.verbali.length && !e.delibere.length) {
-      var elenco = e.richieste.map(function (r) {
-        var q = r.tipo === 'verbale' ? 'il verbale n. ' : (r.tipo === 'delibera' ? 'la delibera n. ' : 'il numero ');
-        return q + r.numero + (r.anno ? '/' + r.anno : '');
-      }).join(', ');
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessun riscontro</span>' +
-        'Nell\'archivio non risulta ' + esc(elenco) + '.<br>' +
-        'L\'elenco completo è consultabile nelle schede Verbali e Delibere.</div>';
-      return;
-    }
-
-    var h = '<div class="riepilogo">';
-    var parti = [];
-    if (e.verbali.length) parti.push('<strong>' + e.verbali.length + '</strong> ' + (e.verbali.length === 1 ? 'verbale' : 'verbali'));
-    if (e.delibere.length) parti.push('<strong>' + e.delibere.length + '</strong> ' + (e.delibere.length === 1 ? 'delibera' : 'delibere'));
-    h += parti.join(' e ') + '.</div>';
-
-    e.verbali.forEach(function (d) { h += schedaVerbaleCompleto(d); });
-    e.delibere.forEach(function (voce) { h += schedaDelibera(voce); });
-
-    v.innerHTML = h;
-  }
-
-  /* -------------------------------- trattazione integrale di un punto */
-
-  var contatoreEspansioni = 0;
-
-  function classeCapoverso(t) {
-    var s = t.trim();
-    if (RE_FORMULA.test(s)) return 'formula';
-    if (RE_PREMESSA_RIGA.test(s)) return 'premessa';
-    return '';
-  }
-
-  /* Ricompone il testo di una sezione a partire dai paragrafi che vi
-     appartengono, evidenziando ogni occorrenza dei termini cercati. La
-     finestra di contesto e' infinita: il testo non viene troncato. */
-  function testoIntegraleSezione(d, sezioneIdx, ricerca) {
-    var matchers = ricerca ? (ricerca.singoli && ricerca.singoli.length ? ricerca.singoli : ricerca.matchers) : null;
-    var parti = [], occorrenze = 0;
-    d.paragrafi.forEach(function (p) {
-      if (p.s !== sezioneIdx) return;
-      var cl = classeCapoverso(p.t);
-      var html;
-      if (matchers) {
-        var ev = P.evidenzia(p.t, matchers, Infinity, true);
-        occorrenze += ev.occorrenze || 0;
-        html = ev.html;
-      } else {
-        html = esc(p.t);
-      }
-      parti.push('<p' + (cl ? ' class="' + cl + '"' : '') + '>' + html + '</p>');
-    });
-    if (!parti.length) return { html: '<p><em>Testo non disponibile per questo punto.</em></p>', occorrenze: 0 };
-    return { html: parti.join(''), occorrenze: occorrenze, capoversi: parti.length };
-  }
-
-  function commutaEspansione(bottone) {
-    var cont = el(bottone.dataset.espandi);
-    if (!cont) return;
-
-    if (!cont.hidden) {
-      cont.hidden = true;
-      bottone.textContent = bottone.dataset.etichetta || 'Mostra il punto per intero';
-      bottone.classList.add('rilievo');
-      return;
-    }
-
-    if (!cont.dataset.pronto) {
-      var d = stato.indice && stato.indice.docs ? stato.indice.docs[bottone.dataset.doc] : null;
-      var si = parseInt(bottone.dataset.sez, 10);
-      if (!d) { cont.innerHTML = '<p><em>Verbale non più disponibile nell\'archivio.</em></p>'; }
-      else {
-        var sez = (si >= 0 && d.sezioni[si]) ? d.sezioni[si] : null;
-        var r = testoIntegraleSezione(d, si, stato.ultimaRicerca);
-        var intestazione = '<div class="intestazione-integrale">' +
-          (sez && sez.punto ? 'Punto ' + esc(sez.punto) + ' all\'ordine del giorno · ' : '') +
-          esc(etichettaVerbale(d)) + (d.dataLabel ? ' del ' + esc(d.dataLabel) : '') +
-          ' · ' + r.capoversi + (r.capoversi === 1 ? ' capoverso' : ' capoversi') +
-          (r.occorrenze ? ' · ' + r.occorrenze + (r.occorrenze === 1 ? ' occorrenza evidenziata' : ' occorrenze evidenziate') : '') +
-          '</div>';
-        cont.innerHTML = intestazione + r.html;
-      }
-      cont.dataset.pronto = '1';
-    }
-    cont.hidden = false;
-    if (!bottone.dataset.etichetta) bottone.dataset.etichetta = bottone.textContent;
-    bottone.textContent = 'Nascondi il testo integrale';
-    bottone.classList.remove('rilievo');
-  }
-
-  function disegnaRisultati(ricerca) {
-    var v = el('vista-risultati');
-
-    if (!ricerca) {
-      var n = docs().filter(function (d) { return !d.errore; }).length;
-      var nd = 0;
-      docs().forEach(function (d) { nd += (d.delibere || []).length; });
-      v.innerHTML = '<div class="vuoto"><span class="grande">Archivio pronto alla consultazione</span>' +
-        esc(n) + ' verbali indicizzati, ' + esc(nd) + ' delibere censite.<br>' +
-        'La ricerca si apre dal menu \u22ef in alto a destra, voce «Cerca nei verbali».' +
-        '<div class="azioni-punto" style="justify-content:center;margin-top:14px">' +
-        '<button class="bottone primario" data-apri-ricerca="1">Cerca nei verbali</button></div></div>';
-      return;
-    }
-
-    if (!stato.risultati.length) {
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessun riscontro</span>' +
-        'La ricerca ' + (ricerca.modo === 'frase' ? 'della frase' : 'delle parole') + ' &laquo;' + esc(ricerca.q) +
-        '&raquo; non ha prodotto risultati.<br>Si può provare con la ricerca per parole, ' +
-        'con le forme derivate, oppure ampliando l\'ambito al punto all\'o.d.g. o al verbale.</div>';
-      return;
-    }
-
-    var totPunti = 0, totOcc = 0;
-    stato.risultati.forEach(function (g) { totPunti += g.voci.length; totOcc += g.occorrenze; });
-
-    function pl(n, sing, plur) { return '<strong>' + n + '</strong> ' + (n === 1 ? sing : plur); }
-
-    var h = '<div class="riepilogo">' + pl(totOcc, 'occorrenza', 'occorrenze') + ' in ' +
-      pl(totPunti, 'punto', 'punti') + ' di ' + pl(stato.risultati.length, 'verbale', 'verbali') +
-      (ricerca.ambito !== 'paragrafo' ? ' (ambito: ' + (ricerca.ambito === 'punto' ? 'stesso punto all\'o.d.g.' : 'stesso verbale') + ')' : '') +
-      '. <button class="bottone minuto" data-raccogli-ricerca="1">Aggiungi tutti gli stralci alla raccolta</button></div>';
-
-    stato.risultati.forEach(function (g) {
-      var d = g.doc;
-      h += '<div class="gruppo-verbale">';
-      h += '<div class="intestazione-verbale">' +
-        '<span class="numero">' + esc(etichettaVerbale(d)) + '</span>' +
-        '<span class="data">' + (d.dataLabel ? 'seduta del ' + esc(d.dataLabel) : 'data non rilevata') + '</span>' +
-        '<span class="nomefile">' + esc(d.nome) + '</span></div>';
-
-      g.voci.forEach(function (voce) {
-        var sez = voce.sezione;
-        h += '<div class="scheda-punto">';
-        h += '<div class="punto-riga1">' + tagSezione(sez) +
-          '<span class="tag occorrenze">' + voce.occorrenze + (voce.occorrenze === 1 ? ' occorrenza' : ' occorrenze') + '</span></div>';
-        h += '<div class="punto-titolo">' + esc(sez ? (sez.titolo || sez.intestazione || '—') : 'Testo non riferibile a un punto specifico') + '</div>';
-        if (sez && sez.sottopunti && sez.sottopunti.length) {
-          h += '<div class="punto-sottopunti">Sottopunti: ' + esc(sez.sottopunti.join(' · ')) + '</div>';
-        }
-
-        h += '<div class="frammenti">';
-        var mostrati = 0;
-        // Con ambito esteso i termini possono stare in paragrafi diversi: si
-        // evidenzia quello che effettivamente compare in ciascun passaggio.
-        var perEvidenza = ricerca.ambito === 'paragrafo' ? ricerca.matchers : ricerca.singoli;
-        var qualsiasi = ricerca.ambito !== 'paragrafo';
-        voce.paragrafi.forEach(function (idx) {
-          if (mostrati >= 3) return;
-          var testo = d.paragrafi[idx].t;
-          var ev = P.evidenzia(testo, perEvidenza, 150, qualsiasi);
-          h += '<div class="frammento">' + ev.html + '</div>';
-          mostrati++;
-        });
-        if (voce.paragrafi.length > mostrati) {
-          h += '<div class="altri-frammenti">e altri ' + (voce.paragrafi.length - mostrati) + ' passaggi nello stesso punto.</div>';
-        }
-        h += '</div>';
-
-        // contenitore della trattazione integrale, riempito al primo clic
-        var idEsp = 'esp-' + (++contatoreEspansioni);
-        h += '<div class="testo-integrale" id="' + idEsp + '" hidden></div>';
-
-        h += '<div class="azioni-punto">' +
-          '<button class="bottone minuto rilievo" data-espandi="' + idEsp + '" ' +
-          'data-doc="' + esc(d.nome) + '" data-sez="' + voce.sezioneIdx + '">' +
-          (sez && sez.punto ? 'Mostra il punto per intero' : 'Mostra il passo per intero') + '</button>' +
-          '<button class="bottone minuto" data-raccogli-punto="' + esc(d.nome) + '" ' +
-          'data-sez="' + voce.sezioneIdx + '" data-paragrafi="' + esc(JSON.stringify(voce.paragrafi)) + '">' +
-          'Aggiungi alla raccolta</button>' +
-          '<button class="bottone minuto" data-apri="' + esc(d.nome) + '">Apri il verbale</button>' +
-          '<button class="bottone minuto" data-cartella="' + esc(d.nome) + '">Mostra su GitHub</button>' +
-          '</div>';
-        h += '</div>';
-      });
-      h += '</div>';
-    });
-
-    v.innerHTML = h;
-  }
-
-  /* ------------------------------------------------------- vista verbali */
-
-  function disegnaVerbali() {
-    var arr = ordinaDocs(docs(), 'recenti');
-    if (!arr.length) {
-      el('vista-verbali').innerHTML = '<div class="vuoto"><span class="grande">Archivio vuoto</span>' +
-        'Nessun verbale presente nell\'archivio.</div>';
-      return;
-    }
-    /* La tabella è la prima cosa sotto la barra delle schede: la nota che la
-       spiega viene dopo. */
-    var h = '';
-    h += '<div class="tabella-contenitore"><table><thead><tr>' +
-      '<th class="num">Verbale</th><th>Seduta</th><th class="num">Punti</th><th class="num">Delibere</th>' +
-      '<th>Delibere adottate</th><th>File</th></tr></thead><tbody>';
-    arr.forEach(function (d, i) {
-      var punti = d.sezioni.filter(function (s) { return s.punto; }).length;
-      h += '<tr class="riga-espandi" data-riga="' + i + '">' +
-        '<td class="num">' + (d.numero != null ? esc(d.numero) : '—') + (d.annoScolastico ? '<span style="color:var(--testo-debole)">/' + esc(d.annoScolastico) + '</span>' : '') + '</td>' +
-        '<td>' + esc(d.dataLabel || '—') + '</td>' +
-        '<td class="num">' + punti + '</td>' +
-        '<td class="num">' + (d.delibere || []).length + '</td>' +
-        '<td class="mono">' + esc((d.delibere || []).join(', ') || '—') + '</td>' +
-        '<td class="mono">' + esc(d.nome) + (d.errore ? ' <span style="color:var(--allerta)">· non indicizzato</span>' : '') + '</td>' +
-        '</tr>';
-      h += '<tr class="dettaglio-verbale" data-dettaglio="' + i + '" hidden><td colspan="6">';
-      if (d.errore) {
-        h += '<em style="color:var(--allerta)">Indicizzazione non riuscita: ' + esc(d.errore) + '</em>';
-      } else if (!d.odg.length) {
-        h += '<em>Ordine del giorno non riconosciuto. Il testo resta comunque interamente ricercabile.</em>';
-      } else {
-        h += '<ol style="list-style:none">';
-        d.sezioni.forEach(function (s) {
-          if (!s.punto) return;
-          h += '<li><strong>' + esc(s.punto) + '.</strong> ' + esc(s.titolo) +
-            (s.delibere.length ? ' <span class="tag delibera">delibera n. ' + esc(s.delibere.join(', n. ')) + '</span>' : '') +
-            (s.esiti && s.esiti.length ? ' <span class="tag esito">' + esc(s.esiti.join(' · ')) + '</span>' : '') +
-            '</li>';
-        });
-        h += '</ol>';
-      }
-      h += '<div class="azioni-punto" style="margin-top:10px">' +
-        (d.errore ? '' :
-          '<button class="bottone minuto" data-raccogli-odg="' + esc(d.nome) + '">Aggiungi l\'o.d.g. alla raccolta</button>' +
-          '<button class="bottone minuto" data-apri="' + esc(d.nome) + '">Apri il verbale</button>' +
-          '<button class="bottone minuto" data-cartella="' + esc(d.nome) + '">Mostra su GitHub</button>') +
-        '<button class="bottone minuto pericolo" data-rimuovi="' + esc(d.nome) + '">Rimuovi dall\'archivio</button>' +
-        '</div>';
-      h += '</td></tr>';
-    });
-    h += '</tbody></table></div>';
-    h += '<div class="riepilogo" style="margin-top:12px">' + arr.length +
-      ' file nell\'archivio. Un clic sulla riga mostra i punti all\'ordine del giorno.</div>';
-    el('vista-verbali').innerHTML = h;
-    stato._verbaliOrdinati = arr;
-  }
-
-  /* ------------------------------------------------------ vista delibere */
-
-  function elencoDelibere() {
-    var out = [];
-    docs().forEach(function (d) {
-      d.sezioni.forEach(function (s, si) {
-        (s.delibere || []).forEach(function (num) {
-          /* dell'atto si tiene anche la collocazione, perche' la scheda
-             consenta di raccoglierne il testo per la condivisione */
-          var det = null;
-          (s.dettaglioDelibere || []).forEach(function (x) {
-            if (!det && String(x.numero) === String(parseInt(num, 10))) det = x;
-          });
-          out.push({
-            numero: num, ordn: parseInt(num, 10) || 0,
-            verbale: d.numero, dataISO: d.dataISO, data: d.dataLabel,
-            punto: s.punto, oggetto: s.titolo, nome: d.nome,
-            sez: si, id: det ? det.id : null
-          });
-        });
-      });
-    });
-    out.sort(function (a, b) {
-      if ((b.dataISO || '') !== (a.dataISO || '')) return (b.dataISO || '') < (a.dataISO || '') ? -1 : 1;
-      return b.ordn - a.ordn;
-    });
-    return out;
-  }
-
-  function disegnaDelibere(filtro) {
-    var lista = elencoDelibere();
-    var f = P.norm(filtro || '');
-    if (f) {
-      lista = lista.filter(function (r) {
-        return P.norm(r.oggetto + ' ' + r.numero + ' ' + (r.data || '') + ' verbale ' + r.verbale).indexOf(f) >= 0;
-      });
-    }
-    var h = '<div class="filtro-tabella"><input id="filtro-delibere" type="search" placeholder="Filtra per oggetto o numero…" value="' + esc(filtro || '') + '">' +
-      '<span>' + lista.length + (lista.length === 1 ? ' delibera' : ' delibere') + '</span></div>';
-    if (!lista.length) {
-      h += '<div class="vuoto"><span class="grande">Nessuna delibera</span>Non risultano delibere corrispondenti.</div>';
-      el('vista-delibere').innerHTML = h;
-      agganciaFiltroDelibere();
-      return;
-    }
-    h += '<div class="tabella-contenitore"><table><thead><tr>' +
-      '<th class="num">Delibera</th><th class="num">Verbale</th><th>Seduta</th><th class="num">Punto</th><th>Oggetto</th></tr></thead><tbody>';
-    lista.forEach(function (r) {
-      h += '<tr>' +
-        '<td class="num"><strong>' + esc(r.numero) + '</strong></td>' +
-        '<td class="num">' + (r.verbale != null ? 'n. ' + esc(r.verbale) : '—') + '</td>' +
-        '<td>' + esc(r.data || '—') + '</td>' +
-        '<td class="num">' + esc(r.punto || '—') + '</td>' +
-        '<td>' + esc(r.oggetto) +
-        (r.id ? ' <button class="bottone minuto" data-raccogli-delibera="' + esc(r.nome) +
-          '" data-sez="' + r.sez + '" data-delibera="' + esc(r.id) + '">raccogli</button>' : '') +
-        ' <button class="bottone minuto" data-apri="' + esc(r.nome) + '">apri</button></td>' +
-        '</tr>';
-    });
-    h += '</tbody></table></div>';
-    el('vista-delibere').innerHTML = h;
-    agganciaFiltroDelibere();
-  }
-
-  function agganciaFiltroDelibere() {
-    var inp = el('filtro-delibere');
-    if (!inp) return;
-    inp.addEventListener('input', function () {
-      var pos = this.selectionStart, val = this.value;
-      disegnaDelibere(val);
-      var nuovo = el('filtro-delibere');
-      if (nuovo) { nuovo.focus(); try { nuovo.setSelectionRange(pos, pos); } catch (e) { } }
-    });
-  }
-
-  function csvDelibere() {
-    var righe = [['Delibera', 'Verbale', 'Seduta', 'Punto o.d.g.', 'Oggetto', 'File']];
-    elencoDelibere().forEach(function (r) {
-      righe.push([r.numero, r.verbale == null ? '' : r.verbale, r.data || '', r.punto || '', r.oggetto, r.nome]);
-    });
-    return '\uFEFF' + righe.map(function (r) {
-      return r.map(function (c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(';');
-    }).join('\r\n');
-  }
-
-  /* -------------------------------------------- rimozione e ripristino */
-
-  /* La rimozione sposta il file nel Cestino e cancella immediatamente dal
-     memorizzato i dati del verbale, senza attendere la riconciliazione con la
-     cartella: l'eliminazione dei dati dall'archivio deve essere certa. */
-  function rimuoviVerbale(nome) {
-    var d = stato.indice && stato.indice.docs ? stato.indice.docs[nome] : null;
-    var descr = nome;
-    if (d && d.numero != null) {
-      descr = etichettaVerbale(d) + (d.dataLabel ? ' del ' + d.dataLabel : '') + '\n' + nome;
-    }
-    if (!confirm('Rimuovere dall\'archivio il seguente verbale?\n\n' + descr +
-                 '\n\nIl file viene spostato nel Cestino, da cui potrà essere ripristinato. ' +
-                 'I dati corrispondenti vengono eliminati dall\'indice.')) return;
-
-    velo(true, 'Rimozione in corso', nome, 50);
-    chiediJson('/api/rimuovi?nome=' + encodeURIComponent(nome), { method: 'POST' })
-      .then(function () {
-        if (stato.indice && stato.indice.docs) delete stato.indice.docs[nome];
-        delete stato.normCache[nome];
-        stato.indice.generato = new Date().toISOString();
-        return salvaIndice();
-      })
-      .then(function () { return costruisciIndice(false); })
-      .then(function () { return aggiornaCestino(); })
-      .then(function () {
-        velo(false);
-        ridisegnaTutto();
-        alert('Verbale rimosso dall\'archivio e cancellato dall\'indice.\n\n' +
-              'Il file si trova ora nel Cestino, consultabile dall\'omonima scheda.');
-      })
-      .catch(function (e) {
-        velo(false);
-        alert('La rimozione non è andata a buon fine: ' + e.message);
-      });
-  }
-
-  function ripristinaVerbale(stored, originale, sovrascrivi) {
-    var url = '/api/ripristina?nome=' + encodeURIComponent(stored) + (sovrascrivi ? '&sovrascrivi=1' : '');
-    velo(true, 'Ripristino in corso', originale, 50);
-    return chiediJson(url, { method: 'POST' })
-      .then(function () { return costruisciIndice(false); })
-      .then(function () { return aggiornaCestino(); })
-      .then(function () {
-        velo(false);
-        ridisegnaTutto();
-        alert('Verbale ripristinato nell\'archivio e nuovamente indicizzato.');
-      })
-      .catch(function (e) {
-        velo(false);
-        if (e.status === 409) {
-          if (confirm('Nell\'archivio esiste già un file di nome:\n\n' + originale +
-                      '\n\nSostituirlo con quello che si sta ripristinando?')) {
-            return ripristinaVerbale(stored, originale, true);
-          }
-          return null;
-        }
-        alert('Il ripristino non è andato a buon fine: ' + e.message);
-      });
-  }
-
-  function eliminaDalCestino(stored, originale) {
-    if (!confirm('Cancellare definitivamente il seguente file?\n\n' + originale +
-                 '\n\nL\'operazione non è reversibile: il file viene eliminato dal repository e ' +
-                 'nessuna funzione dell\'applicazione potrà recuperarlo.')) return;
-    chiediJson('/api/elimina?nome=' + encodeURIComponent(stored), { method: 'POST' })
-      .then(function () { return aggiornaCestino(); })
-      .then(function () { disegnaCestino(); })
-      .catch(function (e) { alert('La cancellazione non è andata a buon fine: ' + e.message); });
-  }
-
-  function aggiornaCestino() {
-    return chiediJson('/api/cestino').then(function (r) {
-      stato.cestino = (r && r.files) ? r.files : [];
-      stato.cartellaCestino = r ? r.cartella : null;
-      var c = el('conta-cestino');
-      c.textContent = stato.cestino.length;
-      c.hidden = stato.cestino.length === 0;
-      return stato.cestino;
-    }).catch(function () {
-      stato.cestino = [];
-      el('conta-cestino').hidden = true;
-      return [];
-    });
-  }
-
-  function disegnaCestino() {
-    var lista = stato.cestino || [];
-    if (!lista.length) {
-      el('vista-cestino').innerHTML = '<div class="vuoto"><span class="grande">Cestino vuoto</span>' +
-        'I verbali rimossi dall\'archivio finiscono qui e restano recuperabili.<br>' +
-        'La rimozione si comanda dalla scheda Verbali, espandendo la riga del verbale.</div>';
-      return;
-    }
-    var coda = '<div class="riquadro" style="margin-top:14px"><h3>Verbali rimossi dall\'archivio</h3>' +
-      '<p>Questi file non compaiono più nell\'archivio e i loro dati sono stati cancellati ' +
-      'dall\'indice, ma restano nel repository dei dati, nella cartella <span class="mono">' +
-      esc(stato.cartellaCestino || 'Cestino') + '</span>. Il ripristino li riporta ' +
-      'nell\'archivio e li reindicizza. La cancellazione definitiva non è reversibile.</p></div>';
-
-    var h = '';
-    h += '<div class="tabella-contenitore"><table><thead><tr>' +
-      '<th>File rimosso</th><th>Rimosso il</th><th class="num">Dimensione</th><th>Operazioni</th>' +
-      '</tr></thead><tbody>';
-    lista.forEach(function (f) {
-      var quando = '—';
-      if (f.rimossoIl) {
-        var dt = new Date(f.rimossoIl);
-        if (!isNaN(dt.getTime())) quando = dt.toLocaleString('it-IT');
-      }
-      h += '<tr>' +
-        '<td class="mono">' + esc(f.originale) + '</td>' +
-        '<td>' + esc(quando) + '</td>' +
-        '<td class="num">' + dimensioneLeggibile(f.dimensione) + '</td>' +
-        '<td><div class="azioni-punto" style="margin:0">' +
-        '<button class="bottone minuto" data-ripristina="' + esc(f.nome) + '" data-orig="' + esc(f.originale) + '">Ripristina</button>' +
-        '<button class="bottone minuto" data-apri-cestino="' + esc(f.nome) + '">Apri</button>' +
-        '<button class="bottone minuto pericolo" data-elimina="' + esc(f.nome) + '" data-orig="' + esc(f.originale) + '">Cancella definitivamente</button>' +
-        '</div></td></tr>';
-    });
-    h += '</tbody></table></div>';
-    h += coda;
-    el('vista-cestino').innerHTML = h;
-  }
-
-  /* ----------------------------------------------------- vista presenze */
-
-  function etichettaSeduta(d) {
-    return (d.numero != null ? 'n. ' + d.numero : '—') + '  ' + (d.dataLabel || '');
-  }
-
-  function disegnaAvvisoPresenze(p) {
-    /* La segnalazione non occupa più una fascia nella pagina: resta una spia
-       sulla linguetta «Presenze», che pulsa finché ci sono avvisi attivi e
-       porta il numero dei componenti segnalati. Il dettaglio sta nella scheda,
-       dove si va con un tocco. */
-    var conta = el('conta-presenze');
-    if (!conta) return;
-    var rossi = p.allarmi.filter(function (m) { return m.livello === 'rosso'; });
-    conta.textContent = p.allarmi.length;
-    conta.hidden = p.allarmi.length === 0;
-    conta.className = 'contatore' + (rossi.length ? ' allarme' : '') + (p.allarmi.length ? ' lampeggio' : '');
-    conta.title = p.allarmi.length
-      ? p.allarmi.map(function (m) {
-          return m.nome + (m.livello === 'rosso' ? ' (oltre due assenze consecutive)' : ' (due assenze consecutive)');
-        }).join('; ')
-      : '';
-  }
-
-  function schedaAllarme(m) {
-    var h = '<div class="scheda-allarme ' + m.livello + '">';
-    h += '<div class="punto-riga1">';
-    if (m.livello === 'rosso') h += '<span class="tag rosso">oltre due assenze consecutive</span>';
-    else if (m.livello === 'arancione') h += '<span class="tag arancione">due assenze consecutive</span>';
-    else if (m.livello === 'chiuso') h += '<span class="tag chiuso">decadenza registrata</span>';
-    if (!m.inCarica) h += '<span class="tag">non più negli elenchi</span>';
-    if (m.silenziato) h += '<span class="tag">avviso silenziato</span>';
-    h += '</div>';
-    h += '<div class="nome-componente">' + esc(m.nome) + '</div>';
-    h += '<div class="dettaglio">' + esc(m.ruolo || 'ruolo non rilevato') +
-      ' · ' + m.totPresenze + ' presenze, ' + m.totAssenze + ' assenze su ' + p_conta(m) + ' sedute';
-    if (m.serieRossa && m.serieRossa.length) {
-      h += '<br>Serie che ha determinato l\'allarme: ' +
-        esc(m.serieRossa.map(etichettaSeduta).join(' · '));
-    } else if (m.livello === 'arancione' && m.primaDellaSerie) {
-      h += '<br>Assenze consecutive in corso dalla seduta ' + esc(etichettaSeduta(m.primaDellaSerie));
-    }
-    if (m.decadenza) {
-      h += '<br>Decadenza dichiarata con delibera n. ' + esc(m.decadenza.delibera) +
-        (m.decadenza.data ? ' del ' + esc(m.decadenza.data) : '') +
-        (m.decadenza.annotato ? ' · registrata il ' + esc(new Date(m.decadenza.annotato).toLocaleDateString('it-IT')) : '');
-    }
-    if (!m.inCarica && m.livello === 'rosso' && !m.decadenza) {
-      h += '<br><em>Il componente non compare nella tabella presenze del verbale più recente. ' +
-        'L\'avviso non lampeggia più in apertura, ma resta aperto finché non viene registrata ' +
-        'la delibera di decadenza o non se ne dà atto in altro modo.</em>';
-    }
-    h += '</div>';
-
-    h += '<div class="azioni-punto">';
-    h += '<button class="bottone minuto" data-silenzia="' + esc(m.chiave) + '">' +
-      (m.silenziato ? 'Riattiva l\'avviso' : 'Silenzia l\'avviso') + '</button>';
-    if (m.decadenza) {
-      h += '<button class="bottone minuto pericolo" data-revoca-decadenza="' + esc(m.chiave) + '">Revoca la registrazione</button>';
-    } else if (m.livello === 'rosso') {
-      h += '<button class="bottone minuto rilievo" data-apri-decadenza="' + esc(m.chiave) + '">Registra la delibera di decadenza</button>';
-    }
-    h += '</div>';
-
-    if (m.livello === 'rosso' && !m.decadenza) {
-      h += '<div class="modulo-decadenza" id="dec-' + esc(m.chiave).replace(/[^a-z0-9]/g, '-') + '" hidden>' +
-        '<div><label>Delibera n.</label><input class="stretto" data-campo="delibera" placeholder="107/2025-26"></div>' +
-        '<div><label>del</label><input class="stretto" data-campo="data" placeholder="15/05/2026"></div>' +
-        '<button class="bottone minuto primario" data-salva-decadenza="' + esc(m.chiave) + '">Registra</button>' +
-        '</div>';
-    }
-    return h + '</div>';
-  }
-
-  function p_conta(m) {
-    return m.totPresenze + m.totAssenze;
-  }
-
-  /* Comando con cui si stabilisce da quale seduta il monitoraggio delle
-     presenze abbia inizio. Le sedute anteriori restano nell'archivio e nella
-     ricerca: il limite riguarda il solo conteggio delle assenze. */
-  function bloccoInizioMonitoraggio(p) {
-    var s = statoPresenze();
-    var valore = stato.bozzaDataInizio != null ? stato.bozzaDataInizio :
-      (s.dataInizioLabel || (p.dataInizio ? itData(p.dataInizio) : ''));
-
-    var h = '<div class="modulo-cessazione" style="margin:0 0 12px">';
-    h += '<div style="width:100%"><label>Monitoraggio delle presenze a partire dalla seduta del</label>' +
-      '<input id="data-inizio-monitoraggio" placeholder="18/12/2025 oppure dicembre 2025" value="' +
-      esc(valore) + '"></div>';
-    h += '<button class="bottone minuto primario" data-salva-inizio="1">Applica</button>';
-    if (p.dataInizio) {
-      h += '<button class="bottone minuto" data-azzera-inizio="1">Togli il limite</button>';
-    }
-    h += '<p style="font-size:13px;color:var(--testo-tenue);margin:8px 0 0;width:100%">' +
-      'La data indicata è compresa nel monitoraggio. Le sedute anteriori restano indicizzate, ' +
-      'ricercabili e consultabili per intero: escono soltanto dal prospetto, dai totali e dagli ' +
-      'avvisi per assenze consecutive. Il limite si toglie in qualunque momento, e il prospetto ' +
-      'torna a comprendere l\'intero archivio.';
-    if (p.anteriori.length) {
-      h += '<br><strong>' + p.anteriori.length +
-        (p.anteriori.length === 1 ? ' seduta anteriore non concorre' : ' sedute anteriori non concorrono') +
-        ' al monitoraggio:</strong> ' +
-        esc(p.anteriori.map(function (d) { return etichettaSeduta(d); }).join(' · ')) + '.';
-    }
-    h += '</p></div>';
-    return h;
-  }
-
-  /* Composizione del Consiglio: data di inizio del monitoraggio,
-     dichiarazione di cessazione dal mandato, revoca, e comando che riporta in
-     vista i componenti cessati. */
-  function riquadroComposizione(p) {
-    var h = '<div class="riquadro" style="margin-top:18px"><h3>Composizione del Consiglio</h3>';
-    h += '<p>L\'elenco dei componenti è ricavato dalle tabelle presenze dei verbali. ' +
-      'Chi ha cessato il mandato va dichiarato con la relativa decorrenza: le sedute anteriori ' +
-      'conservano il dato che i verbali documentano, quelle successive non lo riguardano più, ' +
-      'e gli avvisi a suo carico si chiudono.</p>';
-
-    h += bloccoInizioMonitoraggio(p);
-
-    h += '<div class="azioni-punto" style="margin:0 0 4px">' +
-      '<button class="bottone minuto rilievo" data-apri-cessazione="1">' +
-      (stato.pannelloCessazione ? 'Chiudi l\'elenco' : 'Dichiara componenti cessati dal mandato') + '</button>' +
-      '<button class="bottone minuto" data-apri-esclusione="1">' +
-      (stato.pannelloEsclusione ? 'Chiudi l\'elenco' : 'Escludi dal monitoraggio') + '</button>';
-    if (p.cessati.length) {
-      h += '<label class="opzione-inline" style="margin-left:10px">' +
-        '<input type="checkbox" id="opt-mostra-cessati"' + (stato.mostraCessati ? ' checked' : '') + '> ' +
-        'mostra anche i ' + p.cessati.length + ' cessati nel prospetto</label>';
-    }
-    h += '</div>';
-
-    if (stato.pannelloCessazione) {
-      h += '<div class="modulo-cessazione">';
-      h += '<div style="width:100%"><label>Cessazione a decorrere dal</label>' +
-        '<input id="data-cessazione" placeholder="01/01/2026 oppure gennaio 2026" value="' +
-        esc(stato.bozzaDataCessazione || '') + '"></div>';
-      h += '<div class="elenco-cessazione">';
-      var disponibili = p.attuali.slice().sort(function (a, b) { return a.nome.localeCompare(b.nome, 'it'); });
-      if (!disponibili.length) h += '<em>Nessun componente da dichiarare.</em>';
-      disponibili.forEach(function (m) {
-        h += '<label class="voce-cessazione"><input type="checkbox" data-cessa="' + esc(m.chiave) + '"> ' +
-          esc(m.nome) + '<small>' + esc(m.ruolo || '—') + '</small></label>';
-      });
-      h += '</div>';
-      h += '<button class="bottone minuto primario" data-salva-cessazione="1">Registra la cessazione</button>';
-      h += '</div>';
-    }
-
-    if (stato.pannelloEsclusione) {
-      h += '<div class="modulo-cessazione">';
-      h += '<p style="font-size:13px;color:var(--testo-tenue);margin:0 0 8px">' +
-        'L\'esclusione toglie il componente dal monitoraggio delle presenze in modo integrale: ' +
-        'non compare fra gli avvisi, non compare nel prospetto, non viene conteggiato. ' +
-        'Il testo dei verbali resta immutato e i suoi nominativi restano ricercabili.</p>';
-      h += '<div class="elenco-cessazione">';
-      var candidati = p.membri.slice().sort(function (a, b) { return a.nome.localeCompare(b.nome, 'it'); });
-      if (!candidati.length) h += '<em>Nessun componente da escludere.</em>';
-      candidati.forEach(function (m) {
-        h += '<label class="voce-cessazione"><input type="checkbox" data-escludi="' + esc(m.chiave) + '"> ' +
-          esc(m.nome) + '<small>' + esc(m.ruolo || '—') + '</small></label>';
-      });
-      h += '</div>';
-      h += '<button class="bottone minuto primario" data-salva-esclusione="1">Escludi i selezionati</button>';
-      h += '</div>';
-    }
-
-    var esclusi = statoPresenze().esclusi || [];
-    if (esclusi.length) {
-      h += '<div class="riquadro-esclusi"><strong>Esclusi dal monitoraggio delle presenze:</strong> ';
-      h += esclusi.map(function (e, i) {
-        return '<span class="voce-esclusa">' + esc(e.etichetta || e.pattern) +
-          '<button class="bottone minuto" data-reintegra="' + i + '" title="Riporta il nominativo nel monitoraggio">reintegra</button></span>';
-      }).join(' ');
-      h += '<div style="margin-top:6px;font-size:12px;color:var(--testo-debole)">' +
-        'Il riconoscimento avviene per cognome, senza distinzione di accenti e maiuscole. ' +
-        'Un eventuale omonimo verrebbe escluso anch\'esso: in tal caso va reintegrato e ' +
-        'sostituito con l\'esclusione del solo componente interessato.</div>';
-      h += '</div>';
-    }
-
-    if (p.cessati.length) {
-      h += '<div class="tabella-contenitore" style="margin-top:12px"><table><thead><tr>' +
-        '<th>Componente cessato</th><th>Ruolo</th><th>Dal</th><th class="num">Sedute</th><th></th>' +
-        '</tr></thead><tbody>';
-      p.cessati.forEach(function (m) {
-        h += '<tr><td>' + esc(m.nome) + '</td><td>' + esc(m.ruolo || '—') + '</td><td>' +
-          esc(m.cessato.dataLabel || m.cessato.data || '—') + '</td><td class="num">' +
-          (m.totPresenze + m.totAssenze) + '</td><td>' +
-          '<button class="bottone minuto" data-revoca-cessazione="' + esc(m.chiave) + '">Revoca</button>' +
-          '</td></tr>';
-      });
-      h += '</tbody></table></div>';
-    }
-
-    return h + '</div>';
-  }
-
-  function disegnaPresenze() {
-    var p = calcolaPresenze();
-    stato.presenzeCalcolo = p;
-    disegnaAvvisoPresenze(p);
-
-    var v = el('vista-presenze');
-
-    if (!p.conTabella.length) {
-      v.innerHTML = '<div class="vuoto"><span class="grande">Nessuna tabella delle presenze</span>' +
-        'In nessuno dei verbali indicizzati è stata riconosciuta la tabella dei componenti.<br>' +
-        'Il riconoscimento è affidabile sui file .docx, dove la tabella ha una struttura propria; ' +
-        'sui .pdf dipende dall\'allineamento dei segni di spunta.</div>';
-      return;
-    }
-
-    /* La scheda comincia con il prospetto, subito sotto la barra delle schede,
-       perché è ciò per cui la si apre. Seguono le note di lettura, le
-       segnalazioni, la composizione del Consiglio e, in fondo, i comandi di
-       esportazione. */
-    var h = '';
-    var segnalazioni = '';
-
-    var daMostrare = p.membri.filter(function (m) {
-      return m.livello === 'rosso' || m.livello === 'arancione' || m.livello === 'chiuso';
-    });
-    if (daMostrare.length) {
-      segnalazioni += '<div class="riepilogo">' + daMostrare.length +
-        (daMostrare.length === 1 ? ' componente segnalato' : ' componenti segnalati') + '.</div>';
-      daMostrare.forEach(function (m) { segnalazioni += schedaAllarme(m); });
-    } else {
-      segnalazioni += '<div class="riquadro"><h3>Nessuna segnalazione</h3>' +
-        '<p>Nessun componente presenta due o più assenze consecutive nelle sedute indicizzate.</p></div>';
-    }
-
-    var note = '<div class="riquadro" style="margin-top:14px"><h3>Come si legge il prospetto</h3>' +
-      '<p>Una colonna per seduta, in ordine cronologico. <strong>P</strong> indica presenza, ' +
-      '<strong>A</strong> assenza, il trattino che il componente non risulta negli elenchi di quella seduta. ' +
-      'Un clic sulla casella ne corregge il contenuto, quando l\'estrazione automatica abbia sbagliato; ' +
-      'le caselle corrette portano un puntino.</p>';
-    if (p.senzaTabella.length) {
-      note += '<p style="color:var(--allerta)">' + p.senzaTabella.length +
-        (p.senzaTabella.length === 1 ? ' verbale non ha' : ' verbali non hanno') +
-        ' una tabella presenze riconosciuta e non compaiono nel prospetto: ' +
-        esc(p.senzaTabella.map(function (d) { return etichettaSeduta(d); }).join(' · ')) + '.</p>';
-    }
-    if (p.dataInizio) {
-      note += '<p>Il monitoraggio ha inizio dalla seduta del <strong>' + esc(itData(p.dataInizio)) +
-        '</strong>. ' + (p.anteriori.length
-          ? (p.anteriori.length === 1 ? 'Una seduta anteriore resta' : p.anteriori.length + ' sedute anteriori restano') +
-            ' nell\'archivio e nella ricerca, fuori dal prospetto e dai conteggi. '
-          : '') +
-        'Il limite si modifica nel riquadro «Composizione del Consiglio», più sotto.</p>';
-    }
-    note += '</div>';
-
-    var visibili = stato.mostraCessati ? p.membri : p.attuali;
-    if (p.cessati.length && !stato.mostraCessati) {
-      h += '<p style="font-size:12.5px;color:var(--testo-debole);margin:0 0 10px">' +
-        p.cessati.length + (p.cessati.length === 1 ? ' componente cessato dal mandato non compare' : ' componenti cessati dal mandato non compaiono') +
-        ' nel prospetto. Il comando che li riporta in vista si trova nel riquadro «Composizione del Consiglio», più sotto.</p>';
-    }
-
-    h += '<div class="tabella-contenitore"><table class="griglia-presenze"><thead><tr>' +
-      '<th>Componente</th>';
-    p.conTabella.forEach(function (d) {
-      h += '<th class="seduta">' + esc(etichettaSeduta(d)) + '</th>';
-    });
-    h += '<th class="num">Consec.</th><th class="num">Ass.</th><th>Stato</th></tr></thead><tbody>';
-
-    visibili.forEach(function (m) {
-      var cls = m.livello === 'rosso' ? ' class="riga-rosso"' :
-        (m.livello === 'arancione' ? ' class="riga-arancione"' :
-          (m.cessato ? ' class="riga-cessato"' : ''));
-      h += '<tr' + cls + '><td class="nome">' + esc(m.nome) +
-        '<small>' + esc(m.ruolo || '—') +
-        (m.cessato ? ' · cessato dal ' + esc(m.cessato.dataLabel || m.cessato.data) : '') + '</small></td>';
-      p.conTabella.forEach(function (d) {
-        var st = m.stati[d.nome];
-        var corretta = statoPresenze().correzioni[d.nome + '||' + m.chiave] ? ' corretta' : '';
-        var lab = st === 'presente' ? 'P' : (st === 'assente' ? 'A' : '–');
-        var c = st === 'presente' ? 'presente' : (st === 'assente' ? 'assente' : 'vuoto');
-        h += '<td class="cella ' + c + corretta + '" data-cella="' + esc(d.nome) + '" data-chiave="' + esc(m.chiave) +
-          '" title="' + esc(m.nome + ' · ' + etichettaSeduta(d)) + '">' + lab + '</td>';
-      });
-      h += '<td class="num">' + (m.serie || '') + '</td><td class="num">' + m.totAssenze + '</td><td>';
-      if (m.livello === 'rosso') h += '<span class="tag rosso">rosso</span>';
-      else if (m.livello === 'arancione') h += '<span class="tag arancione">arancione</span>';
-      else if (m.livello === 'chiuso') h += '<span class="tag chiuso">decaduto</span>';
-      else if (m.livello === 'cessato') h += '<span class="tag chiuso">cessato</span>';
-      else h += '<span style="color:var(--testo-debole)">—</span>';
-      if (!m.inCarica && !m.cessato) h += ' <span class="tag">fuori</span>';
-      h += '</td></tr>';
-    });
-    h += '</tbody></table></div>';
-
-    h += note;
-    h += segnalazioni;
-    h += riquadroComposizione(p);
-
-    /* I comandi di esportazione chiudono la pagina: si usano dopo aver letto
-       il prospetto, non prima. */
-    h += '<div class="riquadro" style="margin-top:18px"><h3>Esportazione</h3>' +
-      '<div class="azioni-punto" style="margin:0">' +
-      '<button class="bottone minuto rilievo" data-stampa-presenze="1">Esporta il prospetto in PDF</button>' +
-      '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto alla raccolta</button>' +
-      '</div></div>';
-
-    el('vista-presenze').innerHTML = h;
-  }
-
-  /* --------------------------------------- comandi della scheda presenze */
-
-  /* Stato ricavato dal documento, senza tenere conto delle correzioni. */
-  function statoEstratto(doc, chiave) {
-    var righe = (doc && doc.presenze && doc.presenze.righe) ? doc.presenze.righe : [];
-    for (var i = 0; i < righe.length; i++) {
-      if (chiaveNome(righe[i].nome) === chiave) {
-        return righe[i].stato === 'assente' ? 'assente' : (righe[i].stato === 'presente' ? 'presente' : null);
-      }
-    }
-    return null;
-  }
-
-  /* Il clic fa ruotare la casella fra presente, assente e non in carica.
-     Quando il valore raggiunto coincide con quello estratto dal documento la
-     correzione viene rimossa, così che la casella torni al dato originario. */
-  function commutaCella(nomeFile, chiave) {
-    var s = statoPresenze();
-    var k = nomeFile + '||' + chiave;
-    var d = stato.indice.docs[nomeFile];
-    if (!d) return;
-    var attuale = statoIn(d, chiave);
-    var prossimo = attuale === 'presente' ? 'assente' : (attuale === 'assente' ? null : 'presente');
-    if (prossimo === statoEstratto(d, chiave)) delete s.correzioni[k];
-    else s.correzioni[k] = prossimo === null ? 'fuori' : prossimo;
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function commutaSilenzio(chiave) {
-    var s = statoPresenze();
-    if (s.silenziati[chiave]) delete s.silenziati[chiave];
-    else s.silenziati[chiave] = new Date().toISOString();
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function registraDecadenza(chiave, delibera, data) {
-    if (!delibera) { alert('Va indicato il numero della delibera con cui il Consiglio ha dichiarato la decadenza.'); return; }
-    var s = statoPresenze();
-    s.decadenze[chiave] = { delibera: delibera, data: data || '', annotato: new Date().toISOString() };
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function revocaDecadenza(chiave) {
-    if (!confirm('Revocare la registrazione della decadenza? L\'avviso torna attivo.')) return;
-    delete statoPresenze().decadenze[chiave];
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  /* ------------------------------------- cessazione dal mandato */
-
-  /* La decorrenza si ricava con il medesimo riconoscimento usato dalla ricerca
-     per data: sono ammesse tanto "01/01/2026" quanto "gennaio 2026". */
-  function decorrenzaCessazione(testo) {
-    var an = analizzaData(testo || '');
-    if (!an || !an.intervalli.length) return null;
-    return an.intervalli[0].da;
-  }
-
-  /* ------------------------- data di inizio del monitoraggio */
-
-  function registraInizioMonitoraggio() {
-    var campo = el('data-inizio-monitoraggio');
-    var testo = campo ? campo.value.trim() : '';
-    var s = statoPresenze();
-    if (!testo) { azzeraInizioMonitoraggio(true); return; }
-    var data = decorrenzaCessazione(testo);
-    if (!data) {
-      alert('Non è stata riconosciuta la data di inizio del monitoraggio.\n\n' +
-        'Sono ammesse forme quali 18/12/2025, 18 dicembre 2025, dicembre 2025.');
-      return;
-    }
-    s.dataInizio = data;
-    s.dataInizioLabel = itData(data);
-    stato.bozzaDataInizio = null;
-    salvaPresenze().then(function () {
-      disegnaPresenze();
-      var p = stato.presenzeCalcolo || calcolaPresenze();
-      alert('Il monitoraggio delle presenze ha inizio dalla seduta del ' + itData(data) + '.\n\n' +
-        (p.anteriori.length
-          ? p.anteriori.length + (p.anteriori.length === 1
-            ? ' seduta anteriore resta nell\'archivio e nella ricerca, fuori dal prospetto.'
-            : ' sedute anteriori restano nell\'archivio e nella ricerca, fuori dal prospetto.')
-          : 'Nessuna seduta dell\'archivio è anteriore a questa data.'));
-    });
-  }
-
-  /* Conserva quanto digitato nel campo della data di inizio, perché un
-     ridisegno della scheda provocato da un altro comando non lo perda. */
-  function memorizzaBozzaInizio() {
-    var c = el('data-inizio-monitoraggio');
-    if (c) stato.bozzaDataInizio = c.value;
-  }
-
-  function azzeraInizioMonitoraggio(tacito) {
-    if (!tacito && !confirm('Togliere il limite?\n\nIl prospetto e gli avvisi torneranno a comprendere ' +
-      'tutte le sedute dell\'archivio, comprese quelle anteriori.')) return;
-    var s = statoPresenze();
-    delete s.dataInizio;
-    delete s.dataInizioLabel;
-    stato.bozzaDataInizio = null;
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function registraCessazione() {
-    var campo = el('data-cessazione');
-    var testo = campo ? campo.value.trim() : '';
-    var data = decorrenzaCessazione(testo);
-    if (!data) {
-      alert('Non è stata riconosciuta la data di decorrenza.\n\n' +
-        'Sono ammesse forme quali 01/01/2026, 1 gennaio 2026, gennaio 2026.');
-      return;
-    }
-
-    var scelti = Array.prototype.slice.call(document.querySelectorAll('[data-cessa]:checked'))
-      .map(function (i) { return i.getAttribute('data-cessa'); });
-    if (!scelti.length) { alert('Non è stato selezionato alcun componente.'); return; }
-
-    var p = stato.presenzeCalcolo || calcolaPresenze();
-    var nomi = scelti.map(function (k) {
-      var m = p.membri.filter(function (x) { return x.chiave === k; })[0];
-      return m ? m.nome : k;
-    });
-
-    if (!confirm('Dichiarare cessati dal mandato, a decorrere dal ' + itData(data) + ', i seguenti componenti?\n\n· ' +
-      nomi.join('\n· ') + '\n\nLe sedute anteriori a quella data conservano le loro presenze; ' +
-      'quelle successive non li riguarderanno e gli avvisi a loro carico si chiuderanno.')) return;
-
-    var s = statoPresenze();
-    scelti.forEach(function (k, i) {
-      s.cessati[k] = { data: data, dataLabel: itData(data), nome: nomi[i], annotato: new Date().toISOString() };
-    });
-    stato.pannelloCessazione = false;
-    stato.bozzaDataCessazione = '';
-    salvaPresenze().then(function () {
-      disegnaPresenze();
-      alert(nomi.length + (nomi.length === 1 ? ' componente dichiarato cessato' : ' componenti dichiarati cessati') +
-        ' dal mandato a decorrere dal ' + itData(data) + '.');
-    });
-  }
-
-  function registraEsclusione() {
-    var scelti = Array.prototype.slice.call(document.querySelectorAll('[data-escludi]:checked'))
-      .map(function (i) { return i.getAttribute('data-escludi'); });
-    if (!scelti.length) { alert('Non è stato selezionato alcun componente.'); return; }
-
-    var p = stato.presenzeCalcolo || calcolaPresenze();
-    var s = statoPresenze();
-    var nomi = [];
-    scelti.forEach(function (k) {
-      var m = p.membri.filter(function (x) { return x.chiave === k; })[0];
-      var nome = m ? m.nome : k;
-      nomi.push(nome);
-      // si esclude il nominativo per intero, non il solo cognome: la grafia è
-      // qui nota, essendo stata ricavata dai verbali
-      if (!s.esclusi.some(function (e) { return e.pattern === chiaveNome(nome); })) {
-        s.esclusi.push({ pattern: chiaveNome(nome), etichetta: nome });
-      }
-    });
-
-    if (!confirm('Escludere dal monitoraggio delle presenze i seguenti componenti?\n\n· ' +
-      nomi.join('\n· ') + '\n\nNon compariranno più fra gli avvisi né nel prospetto. ' +
-      'Il testo dei verbali non viene modificato.')) {
-      nomi.forEach(function (n) {
-        s.esclusi = s.esclusi.filter(function (e) { return e.pattern !== chiaveNome(n); });
-      });
-      return;
-    }
-
-    stato.pannelloEsclusione = false;
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function reintegraEscluso(indice) {
-    var s = statoPresenze();
-    var e = s.esclusi[indice];
-    if (!e) return;
-    if (!confirm('Riportare «' + (e.etichetta || e.pattern) + '» nel monitoraggio delle presenze?')) return;
-    s.esclusi.splice(indice, 1);
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  function revocaCessazione(chiave) {
-    var s = statoPresenze();
-    var nome = (s.cessati[chiave] && s.cessati[chiave].nome) || chiave;
-    if (!confirm('Revocare la cessazione dal mandato di ' + nome + '?\n\n' +
-      'Il componente torna a figurare fra quelli in carica.')) return;
-    delete s.cessati[chiave];
-    salvaPresenze().then(function () { disegnaPresenze(); });
-  }
-
-  /* --------------------------------------------------- vista diagnostica */
-
-  function disegnaDiagnostica() {
-    var arr = ordinaDocs(docs(), 'recenti');
-    var h = '';
-    var errori = arr.filter(function (d) { return d.errore; });
-    var scansioni = arr.filter(function (d) { return !d.errore && d.avviso; });
-    var senzaOdg = arr.filter(function (d) { return !d.errore && !d.odg.length; });
-    var nonLocalizzati = arr.filter(function (d) { return !d.errore && d.puntiNonLocalizzati && d.puntiNonLocalizzati.length; });
-    var senzaData = arr.filter(function (d) { return !d.errore && !d.dataLabel; });
-    var senzaNumero = arr.filter(function (d) { return !d.errore && d.numero == null; });
-
-    if (!arr.length) {
-      el('vista-diagnostica').innerHTML = '<div class="vuoto"><span class="grande">Nulla da verificare</span>L\'archivio è vuoto.</div>';
-      return;
-    }
-
-    var tot = arr.length, ok = arr.filter(function (d) { return !d.errore; }).length;
-    var car = arr.reduce(function (a, d) { return a + (d.caratteri || 0); }, 0);
-    var par = arr.reduce(function (a, d) { return a + (d.paragrafi || []).length; }, 0);
-
-    var delib = arr.reduce(function (a, d) { return a + ((d.delibere || []).length); }, 0);
-    h += '<div class="riquadro"><h3>Stato dell\'indice</h3>' +
-      '<p>' + ok + ' verbali su ' + tot + ' risultano indicizzati, con ' + delib +
-      (delib === 1 ? ' delibera censita' : ' delibere censite') + ', per complessivi ' +
-      par.toLocaleString('it-IT') + ' paragrafi e ' + car.toLocaleString('it-IT') + ' caratteri ricercabili.' +
-      (stato.indice && stato.indice.generato ? ' Ultimo aggiornamento: ' + new Date(stato.indice.generato).toLocaleString('it-IT') + '.' : '') +
-      '</p>' +
-      /* il recapito dell'archivio, tolto dalla testata, si legge qui */
-      '<p class="percorso">' + esc((stato.config && stato.config.archivePath) || '') + '</p>' +
-      '</div>';
-
-    function blocco(titolo, testo, lista, grave) {
-      if (!lista.length) return '';
-      var s = '<div class="riquadro' + (grave ? ' attenzione' : '') + '"><h3>' + esc(titolo) + '</h3><p>' + testo + '</p><ul>';
-      lista.forEach(function (x) { s += '<li>' + x + '</li>'; });
-      return s + '</ul></div>';
-    }
-
-    h += blocco('File non indicizzati', 'Questi file non è stato possibile leggerli. I formati .doc di vecchia generazione vanno riaperti con Word e salvati in .docx.',
-      errori.map(function (d) { return esc(d.nome) + ' — ' + esc(d.errore); }), true);
-
-    h += blocco('Verbali privi di testo estraibile', 'Si tratta con ogni probabilità di scansioni prive di riconoscimento ottico dei caratteri: non sono ricercabili finché non si applica un OCR.',
-      scansioni.map(function (d) { return esc(d.nome) + ' — ' + esc(d.caratteri) + ' caratteri estratti'; }), true);
-
-    h += blocco('Ordine del giorno non riconosciuto', 'Il testo resta interamente ricercabile, ma i riscontri non potranno essere attribuiti a un punto specifico.',
-      senzaOdg.map(function (d) { return esc(d.nome); }), false);
-
-    h += blocco('Punti non localizzati nel corpo del verbale', 'Questi punti compaiono nell\'elenco iniziale ma la relativa trattazione non è stata individuata nel corpo del documento, di norma perché l\'intestazione usata nel testo differisce sensibilmente dalla dizione dell\'ordine del giorno.',
-      nonLocalizzati.map(function (d) { return '<strong>' + esc(d.nome) + '</strong>: ' + esc(d.puntiNonLocalizzati.join(' | ')); }), false);
-
-    h += blocco('Data della seduta non rilevata', 'Conviene indicare la data nel nome del file, per esempio «VERBALE n.10 ... 23 aprile 2026.docx».',
-      senzaData.map(function (d) { return esc(d.nome); }), false);
-
-    h += blocco('Numero del verbale non rilevato', 'Conviene indicare il numero nel nome del file, per esempio «VERBALE n.10 ...».',
-      senzaNumero.map(function (d) { return esc(d.nome); }), false);
-
-    if (!errori.length && !scansioni.length && !senzaOdg.length && !nonLocalizzati.length && !senzaData.length && !senzaNumero.length) {
-      h += '<div class="riquadro"><h3>Nessuna anomalia</h3><p>Tutti i verbali sono stati riconosciuti nella loro struttura: numero, data, punti all\'ordine del giorno e delibere.</p></div>';
-    }
-
-    h += '<div class="riquadro"><h3>Attendibilità del riconoscimento dei punti</h3>' +
-      '<p>Per ciascun punto viene calcolato un grado di corrispondenza fra la dizione dell\'ordine del giorno e l\'intestazione trovata nel corpo del verbale. Un valore inferiore a 0,60 merita una verifica manuale.</p>' +
-      '<div class="tabella-contenitore"><table><thead><tr><th class="num">Verbale</th><th class="num">Punto</th><th>Dizione nell\'o.d.g.</th><th>Intestazione nel testo</th><th class="num">Corrisp.</th></tr></thead><tbody>';
-    var dubbi = 0;
-    arr.forEach(function (d) {
-      d.sezioni.forEach(function (s) {
-        if (!s.punto || s.affidabilita == null || s.affidabilita >= 0.6) return;
-        dubbi++;
-        h += '<tr><td class="num">' + esc(d.numero) + '</td><td class="num">' + esc(s.punto) + '</td><td>' +
-          esc(s.titolo) + '</td><td>' + esc(s.intestazione || '— non individuata —') + '</td><td class="num">' +
-          esc(String(s.affidabilita).replace('.', ',')) + '</td></tr>';
-      });
-    });
-    if (!dubbi) h += '<tr><td colspan="5"><em>Nessun punto con corrispondenza dubbia.</em></td></tr>';
-    h += '</tbody></table></div></div>';
-
-    el('vista-diagnostica').innerHTML = h;
-  }
-
-  /* ------------------------------------------------------------ caricamento */
-
-  function caricaFiles(lista) {
-    var files = Array.prototype.slice.call(lista).filter(function (f) {
-      return /\.(docx|pdf|txt|doc)$/i.test(f.name);
-    });
-    if (!files.length) {
-      alert('Nessun file utilizzabile. Sono ammessi i formati .docx, .pdf e .txt.');
-      return Promise.resolve();
-    }
-
-    var fatti = 0, caricati = [], saltati = [];
-    velo(true, 'Caricamento nell\'archivio', '', 0);
-
-    var seq = Promise.resolve();
-    files.forEach(function (f) {
-      seq = seq.then(function () {
-        velo(true, 'Caricamento nell\'archivio', f.name, (fatti / files.length) * 100);
-        return f.arrayBuffer().then(function (buf) {
-          return fetch('/api/upload?nome=' + encodeURIComponent(f.name), { method: 'POST', body: buf })
-            .then(function (r) {
-              if (r.status === 409) {
-                velo(false);
-                var sovrascrivi = confirm('Nell\'archivio esiste già un file di nome:\n\n' + f.name +
-                  '\n\nSostituirlo con quello che si sta caricando?');
-                velo(true, 'Caricamento nell\'archivio', f.name, (fatti / files.length) * 100);
-                if (!sovrascrivi) { saltati.push(f.name); return null; }
-                return fetch('/api/upload?nome=' + encodeURIComponent(f.name) + '&sovrascrivi=1', { method: 'POST', body: buf });
-              }
-              return r;
-            })
-            .then(function (r) {
-              if (r && !r.ok) throw new Error('HTTP ' + r.status);
-              if (r) caricati.push(f.name);
-            });
-        }).catch(function (e) {
-          saltati.push(f.name + ' (' + (e.message || e) + ')');
-        }).then(function () { fatti++; });
-      });
-    });
-
-    return seq.then(function () {
-      velo(false);
-      return costruisciIndice(false);
-    }).then(function () {
-      ridisegnaTutto();
-      var msg = caricati.length + (caricati.length === 1 ? ' verbale aggiunto' : ' verbali aggiunti') + ' all\'archivio e indicizzato.';
-      if (saltati.length) msg += '\n\nNon acquisiti:\n· ' + saltati.join('\n· ');
-      alert(msg);
-    });
-  }
-
-  /* ---------------------------------------------------------------- stato */
-
-  function aggiornaStato() {
-    var c = stato.config || {};
-    var n = docs().length;
-    var ok = docs().filter(function (d) { return !d.errore && !d.avviso; }).length;
-    var nd = 0;
-    docs().forEach(function (d) { nd += (d.delibere || []).length; });
-    var problemi = n - ok;
-
-    /* La riga di stato compare soltanto quando c'è qualcosa da sapere:
-       archivio irraggiungibile o verbali da verificare. Quando tutto è in
-       ordine resta nascosta, e il conteggio dei verbali e delle delibere si
-       legge nella scheda Diagnostica. */
-    var riga = el('stato-archivio');
-    var h = '';
-    h += '<span class="pill' + (c.esiste ? '' : ' err') + '">' + (c.esiste ? 'archivio collegato' : 'archivio non trovato') + '</span>';
-    h += '<span class="pill">' + n + ' verbali</span>';
-    h += '<span class="pill">' + nd + ' delibere</span>';
-    if (problemi > 0) h += '<span class="pill err">' + problemi + ' da verificare</span>';
-    h += '<span class="percorso">' + esc(c.archivePath || '') + '</span>';
-    /* Il contenuto viene composto sempre, così che resti leggibile da chi
-       interroga la pagina, ma la riga si mostra soltanto quando c'è qualcosa
-       da sapere. */
-    riga.innerHTML = h;
-    riga.hidden = c.esiste && problemi === 0;
-    stato.contaVerbali = n;
-    stato.contaDelibere = nd;
-  }
-
-  function ridisegnaTutto() {
-    aggiornaStato();
-    if (el('q').value.trim()) cerca(); else disegnaRisultati(null);
-    disegnaVerbali();
-    disegnaDelibere(el('filtro-delibere') ? el('filtro-delibere').value : '');
-    disegnaCestino();
-    disegnaPresenze();
-    disegnaCondivisione();
-    disegnaDiagnostica();
-  }
-
-  var SEGNAPOSTO = {
-    parole: 'Una, due o tre parole: palestra, stage linguistico, conto consuntivo…',
-    frase: 'La frase esatta da cercare: impianti sportivi, conto consuntivo…',
-    numero: 'Il numero: 10, verbale 10, delibera 96, d 96/2025-26…',
-    data: 'La data: 23/04/2026, aprile 2026, 2026, a.s. 2025/26…'
-  };
-
-  function aggiornaModo() {
-    var modo = document.querySelector('input[name=modo]:checked').value;
-    document.body.classList.toggle('modo-numero', modo === 'numero');
-    document.body.classList.toggle('modo-data', modo === 'data');
-    el('q').placeholder = SEGNAPOSTO[modo] || SEGNAPOSTO.parole;
-  }
-
-  /* ==================================================================
-     RACCOLTA DA CONDIVIDERE E STAMPA IN PDF
-
-     Quanto puo' essere utile a terzi - il prospetto delle presenze, il
-     testo di una delibera con lo sviluppo del punto all'ordine del
-     giorno, gli stralci restituiti da una ricerca, l'ordine del giorno
-     di una seduta - viene raccolto in un elenco e composto in un unico
-     foglio, che si stampa oppure si salva in PDF dalla finestra di
-     stampa del browser (voce «Salva come PDF» fra le destinazioni).
-     ================================================================== */
-
-  var CHIAVE_RACCOLTA = 'archivio-verbali-raccolta-1';
-  var MARGINE_MM = 10;          /* margine della pagina, in millimetri */
-  var SCALA_MINIMA = 0.34;      /* oltre questa riduzione il testo non si legge */
-  var contatoreVoci = 0;
-
-  stato.raccolta = [];
-  stato.intestazione = { titolo: '', nota: '' };
-  stato.stampa = null;          /* { voci, opzioni } in corso di anteprima */
-
-  var MESI_IT = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno',
-    'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
-
-  function dataEstesa(d) {
-    var x = d || new Date();
-    return x.getDate() + ' ' + MESI_IT[x.getMonth()] + ' ' + x.getFullYear();
-  }
-
-  /* Data della seduta in forma compatta per le intestazioni di colonna:
-     23/04/2026 diventa 23/04/26, che in otto punti tipografici sta. */
-  function dataBreve(d) {
-    var t = d.dataLabel || '';
-    var m = t.match(/^(\d{2})\/(\d{2})\/(\d{2})(\d{2})$/);
-    return m ? m[1] + '/' + m[2] + '/' + m[4] : t;
-  }
-
-  function messaggio(testo) {
-    var box = el('messaggio');
-    box.textContent = testo;
-    box.hidden = false;
-    clearTimeout(box._timer);
-    box._timer = setTimeout(function () { box.hidden = true; }, 2600);
-  }
-
-  /* ------------------------------------------------ tenuta della raccolta */
-
-  /* La raccolta sopravvive alla chiusura del browser: viene conservata
-     nella memoria locale della pagina. Se questa non e' disponibile, la
-     raccolta resta valida per la sola sessione in corso. */
-  function caricaRaccolta() {
-    try {
-      var t = window.localStorage.getItem(CHIAVE_RACCOLTA);
-      if (!t) return;
-      var d = JSON.parse(t);
-      if (d && d.voci) {
-        stato.raccolta = d.voci;
-        stato.intestazione = d.intestazione || { titolo: '', nota: '' };
-        stato.raccolta.forEach(function (v) {
-          var n = parseInt(String(v.id).replace(/\D/g, ''), 10);
-          if (n > contatoreVoci) contatoreVoci = n;
-        });
-      }
-    } catch (e) { /* memoria locale non disponibile: nessuna conseguenza */ }
-  }
-
-  function salvaRaccolta() {
-    try {
-      window.localStorage.setItem(CHIAVE_RACCOLTA, JSON.stringify({
-        voci: stato.raccolta, intestazione: stato.intestazione
-      }));
-    } catch (e) { /* come sopra */ }
-  }
-
-  function aggiornaContatoreRaccolta() {
-    var c = el('conta-raccolta');
-    if (!c) return;
-    c.textContent = stato.raccolta.length;
-    c.hidden = stato.raccolta.length === 0;
-  }
-
-  /* Impronta di una voce, per non raccogliere due volte la stessa cosa. */
-  function improntaVoce(v) {
-    return [v.tipo, v.nome || '', v.sez == null ? '' : v.sez,
-      v.idDelibera || '', v.firma || ''].join('|');
-  }
-
-  function aggiungiVoce(v, descrizione) {
-    var imp = improntaVoce(v);
-    var gia = stato.raccolta.some(function (x) { return improntaVoce(x) === imp; });
-    if (gia && v.tipo !== 'nota' && v.tipo !== 'ricerca') {
-      messaggio('Questo elemento è già nella raccolta.');
-      return;
-    }
-    v.id = 'r' + (++contatoreVoci);
-    stato.raccolta.push(v);
-    salvaRaccolta();
-    aggiornaContatoreRaccolta();
-    disegnaCondivisione();
-    messaggio((descrizione || 'Elemento aggiunto') + ' · ' + stato.raccolta.length +
-      (stato.raccolta.length === 1 ? ' elemento nella raccolta' : ' elementi nella raccolta'));
-  }
-
-  function vocePerId(id) {
-    for (var i = 0; i < stato.raccolta.length; i++) {
-      if (stato.raccolta[i].id === id) return stato.raccolta[i];
-    }
-    return null;
-  }
-
-  function rimuoviVoce(id) {
-    stato.raccolta = stato.raccolta.filter(function (v) { return v.id !== id; });
-    salvaRaccolta();
-    aggiornaContatoreRaccolta();
-    disegnaCondivisione();
-  }
-
-  function spostaVoce(id, verso) {
-    var i = -1;
-    stato.raccolta.forEach(function (v, k) { if (v.id === id) i = k; });
-    var j = i + verso;
-    if (i < 0 || j < 0 || j >= stato.raccolta.length) return;
-    var t = stato.raccolta[i];
-    stato.raccolta[i] = stato.raccolta[j];
-    stato.raccolta[j] = t;
-    salvaRaccolta();
-    disegnaCondivisione();
-  }
-
-  /* --------------------------------------------- comandi di raccolta */
-
-  function docPerNome(nome) {
-    return (stato.indice && stato.indice.docs) ? stato.indice.docs[nome] : null;
-  }
-
-  function contestoRicerca() {
-    var r = stato.ultimaRicerca;
-    if (!r || (r.modo !== 'parole' && r.modo !== 'frase')) return null;
-    return { q: r.q, modo: r.modo, prefisso: !!r.prefisso, ambito: r.ambito };
-  }
-
-  function matchersDa(ric) {
-    if (!ric || !ric.q) return null;
-    var m = P.buildMatchers(ric.q, ric.modo, ric.prefisso);
-    return (m && m.length) ? m : null;
-  }
-
-  function raccogliPunto(nome, sez, paragrafi) {
-    var d = docPerNome(nome);
-    if (!d) return;
-    aggiungiVoce({
-      tipo: 'punto', nome: nome, sez: sez,
-      paragrafi: paragrafi || [],
-      ricerca: contestoRicerca(),
-      opz: { integrale: true, evidenzia: true }
-    }, 'Punto aggiunto alla raccolta');
-  }
-
-  function raccogliDelibera(nome, sez, idDelibera) {
-    aggiungiVoce({
-      tipo: 'delibera', nome: nome, sez: sez, idDelibera: idDelibera,
-      opz: { sviluppo: true }
-    }, 'Delibera aggiunta alla raccolta');
-  }
-
-  function raccogliOdg(nome) {
-    aggiungiVoce({ tipo: 'odg', nome: nome, opz: { delibere: true } },
-      'Ordine del giorno aggiunto alla raccolta');
-  }
-
-  function raccogliPresenze() {
-    aggiungiVoce({
-      tipo: 'presenze',
-      opz: { cessati: false, segnalazioni: true, totali: true, legenda: true }
-    }, 'Prospetto delle presenze aggiunto alla raccolta');
-  }
-
-  /* L'esito di una ricerca viene fissato al momento della raccolta: i
-     verbali possono essere in seguito aggiunti o rimossi, ma cio' che si
-     e' deciso di condividere non deve cambiare da sé. */
-  function raccogliRicerca() {
-    if (!stato.risultati.length) { messaggio('Non vi sono risultati da raccogliere.'); return; }
-    var ric = contestoRicerca();
-    var voci = [];
-    stato.risultati.forEach(function (g) {
-      g.voci.forEach(function (voce) {
-        voci.push({ nome: g.doc.nome, sez: voce.sezioneIdx, paragrafi: voce.paragrafi.slice() });
-      });
-    });
-    aggiungiVoce({
-      tipo: 'ricerca', ricerca: ric, elementi: voci,
-      firma: (ric ? ric.q : '') + '#' + voci.length + '#' + Date.now(),
-      opz: { integrale: false, evidenzia: true }
-    }, 'Stralci della ricerca aggiunti alla raccolta');
-  }
-
-  /* ------------------------------------- composizione del foglio stampato */
-
-  /* Il titolo del blocco si omette quando ripeterebbe quello che
-     l'intestazione del foglio gia' riporta. */
-  function titoloBlocco(testo, opzGen) {
-    return (opzGen && opzGen.unico) ? '' : '<h2>' + testo + '</h2>';
-  }
-
-  function sezioneDi(d, si) {
-    return (d && si != null && si >= 0 && d.sezioni[si]) ? d.sezioni[si] : null;
-  }
-
-  function riferimentoVerbale(d, sez) {
-    var parti = [etichettaVerbale(d)];
-    if (d.dataLabel) parti.push('seduta del ' + d.dataLabel);
-    if (sez && sez.punto) parti.push('punto ' + sez.punto + ' all\'ordine del giorno');
-    return parti.join(' · ');
-  }
-
-  /* Testo di una sezione, per intero oppure nei soli passaggi indicati,
-     con i termini cercati evidenziati quando richiesto. */
-  function testoPerStampa(d, si, paragrafi, matchers, integrale) {
-    var out = [];
-    if (integrale) {
-      d.paragrafi.forEach(function (p) {
-        if (p.s !== si) return;
-        var cl = classeCapoverso(p.t);
-        var html = matchers ? P.evidenzia(p.t, matchers, Infinity, true).html : esc(p.t);
-        out.push('<p' + (cl ? ' class="' + cl + '"' : '') + '>' + html + '</p>');
-      });
-    } else {
-      (paragrafi || []).forEach(function (idx) {
-        var p = d.paragrafi[idx];
-        if (!p) return;
-        var html = matchers ? P.evidenzia(p.t, matchers, 320, true).html : esc(p.t);
-        out.push('<p class="passaggio">' + html + '</p>');
-      });
-    }
-    if (!out.length) out.push('<p><em>Testo non disponibile.</em></p>');
-    return out.join('');
-  }
-
-  function bloccoPunto(v, opzGen) {
-    var d = docPerNome(v.nome);
-    if (!d) return '<div class="blocco"><p><em>Il verbale ' + esc(v.nome) +
-      ' non è più presente nell\'archivio.</em></p></div>';
-    var sez = sezioneDi(d, v.sez);
-    var integrale = v.opz.integrale !== false;
-    var matchers = (opzGen.evidenzia && v.opz.evidenzia !== false) ? matchersDa(v.ricerca) : null;
-
-    var h = '<div class="blocco">';
-    h += titoloBlocco((sez && sez.punto ? 'Punto ' + esc(sez.punto) + ' all\'ordine del giorno' : 'Stralcio del verbale'), opzGen);
-    h += '<div class="riferimento">' + esc(riferimentoVerbale(d, null)) + '</div>';
-    if (sez && (sez.titolo || sez.intestazione)) {
-      h += '<p class="oggetto">' + esc(sez.titolo || sez.intestazione) + '</p>';
-    }
-    if (sez && sez.delibere && sez.delibere.length) {
-      h += '<p class="riferimento">Delibera n. ' + esc(sez.delibere.join(', n. ')) + '</p>';
-    }
-    h += testoPerStampa(d, v.sez, v.paragrafi, matchers, integrale);
-    return h + '</div>';
-  }
-
-  function bloccoDelibera(v, opzGen) {
-    var d = docPerNome(v.nome);
-    if (!d) return '<div class="blocco"><p><em>Il verbale ' + esc(v.nome) +
-      ' non è più presente nell\'archivio.</em></p></div>';
-    var sez = sezioneDi(d, v.sez);
-    var del = null;
-    ((sez && sez.dettaglioDelibere) || []).forEach(function (x) {
-      if (x.id === v.idDelibera) del = x;
-    });
-
-    var h = '<div class="blocco">';
-    h += titoloBlocco('Delibera n. ' + esc(del ? del.id : v.idDelibera), opzGen);
-    h += '<div class="riferimento">' + esc(riferimentoVerbale(d, sez)) + '</div>';
-    if (sez && sez.titolo) h += '<p class="oggetto">Oggetto: ' + esc(sez.titolo) + '</p>';
-    h += formattaTestoDelibera(del ? del.testo : '');
-
-    if (v.opz.sviluppo !== false && sez) {
-      h += '<div class="sotto-titolo-blocco">Sviluppo del punto all\'ordine del giorno</div>';
-      h += testoPerStampa(d, v.sez, null, null, true);
-    }
-    return h + '</div>';
-  }
-
-  function bloccoOdg(v, opzGen) {
-    var d = docPerNome(v.nome);
-    if (!d) return '<div class="blocco"><p><em>Il verbale ' + esc(v.nome) +
-      ' non è più presente nell\'archivio.</em></p></div>';
-    var perPunto = {};
-    d.sezioni.forEach(function (s) { if (s.punto) perPunto[s.punto] = s; });
-
-    var h = '<div class="blocco">';
-    h += titoloBlocco('Ordine del giorno · ' + esc(etichettaVerbale(d)), opzGen);
-    h += '<div class="riferimento">' +
-      (d.dataLabel ? 'Seduta del ' + esc(d.dataLabel) : 'Data non rilevata') +
-      ' · ' + (d.delibere || []).length +
-      ((d.delibere || []).length === 1 ? ' delibera adottata' : ' delibere adottate') + '</div>';
-    if (!d.odg.length) {
-      h += '<p><em>L\'ordine del giorno non è stato riconosciuto in questo verbale.</em></p>';
-      return h + '</div>';
-    }
-    h += '<ul class="odg-stampa">';
-    d.odg.forEach(function (it) {
-      var s = perPunto[it.num];
-      h += '<li' + (it.level > 0 ? ' class="sotto"' : '') + '><strong>' + esc(it.num) + '.</strong> ' + esc(it.titolo);
-      if (s && v.opz.delibere !== false) {
-        (s.delibere || []).forEach(function (num) {
-          h += ' <span class="segno">[delibera n. ' + esc(num) + ']</span>';
-        });
-        (s.esiti || []).forEach(function (e) {
-          if (e === 'deliberato') return;
-          h += ' <span class="segno">[' + esc(e) + ']</span>';
-        });
-      }
-      h += '</li>';
-    });
-    h += '</ul>';
-    return h + '</div>';
-  }
-
-  function bloccoRicerca(v, opzGen) {
-    var ric = v.ricerca;
-    var matchers = (opzGen.evidenzia && v.opz.evidenzia !== false) ? matchersDa(ric) : null;
-    var integrale = v.opz.integrale === true;
-
-    var h = '<div class="blocco">';
-    h += titoloBlocco('Stralci dei verbali', opzGen);
-    h += '<div class="riferimento">' +
-      (ric ? 'Ricerca ' + (ric.modo === 'frase' ? 'della frase' : 'delle parole') +
-        ' «' + esc(ric.q) + '»' : 'Selezione di passaggi') +
-      ' · ' + v.elementi.length + (v.elementi.length === 1 ? ' punto' : ' punti') + '</div>';
-
-    var perVerbale = [];
-    var mappa = {};
-    v.elementi.forEach(function (e) {
-      if (!mappa[e.nome]) { mappa[e.nome] = { nome: e.nome, voci: [] }; perVerbale.push(mappa[e.nome]); }
-      mappa[e.nome].voci.push(e);
-    });
-
-    perVerbale.forEach(function (g) {
-      var d = docPerNome(g.nome);
-      if (!d) {
-        h += '<p><em>Il verbale ' + esc(g.nome) + ' non è più presente nell\'archivio.</em></p>';
-        return;
-      }
-      h += '<div class="sotto-titolo-blocco">' + esc(etichettaVerbale(d)) +
-        (d.dataLabel ? ' · seduta del ' + esc(d.dataLabel) : '') + '</div>';
-      g.voci.forEach(function (e) {
-        var sez = sezioneDi(d, e.sez);
-        h += '<p class="oggetto">' +
-          (sez && sez.punto ? 'Punto ' + esc(sez.punto) + ' o.d.g. — ' : '') +
-          esc(sez ? (sez.titolo || sez.intestazione || 'parte accessoria') : 'parte accessoria') +
-          (sez && sez.delibere && sez.delibere.length ?
-            ' <span class="segno">[delibera n. ' + esc(sez.delibere.join(', n. ')) + ']</span>' : '') +
-          '</p>';
-        h += testoPerStampa(d, e.sez, e.paragrafi, matchers, integrale);
-      });
-    });
-    return h + '</div>';
-  }
-
-  function bloccoNota(v) {
-    var t = String(v.testo || '').trim();
-    if (!t) return '';
-    var h = '<div class="blocco">';
-    t.split(/\n{2,}/).forEach(function (par, i) {
-      var righe = par.split('\n').filter(function (r) { return r.trim(); });
-      if (!righe.length) return;
-      if (i === 0 && righe.length > 1 && righe[0].length < 90 && !/[.;:]$/.test(righe[0].trim())) {
-        h += '<h2>' + esc(righe.shift().trim()) + '</h2>';
-      }
-      if (righe.length) h += '<p>' + righe.map(esc).join('<br>') + '</p>';
-    });
-    return h + '</div>';
-  }
-
-  /* ------------------------------------ prospetto delle presenze stampato */
-
-  function bloccoPresenze(v, opzGen) {
-    var p = calcolaPresenze();
-    if (!p.conTabella.length) {
-      return '<div class="blocco"><h2>Prospetto delle presenze</h2>' +
-        '<p><em>In nessuno dei verbali indicizzati è stata riconosciuta la tabella dei componenti.</em></p></div>';
-    }
-    var opz = v.opz || {};
-    var visibili = opz.cessati ? p.membri : p.attuali;
-    var prima = p.conTabella[0], ultima = p.conTabella[p.conTabella.length - 1];
-
-    var h = '<div class="blocco">';
-    h += titoloBlocco('Prospetto delle presenze', opzGen);
-    h += '<div class="riferimento">' + p.conTabella.length +
-      (p.conTabella.length === 1 ? ' seduta' : ' sedute') +
-      (prima.dataLabel && ultima.dataLabel ? ' · dal ' + esc(prima.dataLabel) + ' al ' + esc(ultima.dataLabel) : '') +
-      ' · ' + visibili.length + (visibili.length === 1 ? ' componente' : ' componenti') + '</div>';
-
-    h += '<div class="riquadro-tabella"><table class="prospetto"><thead><tr><th class="nome">Componente</th>';
-    p.conTabella.forEach(function (d) {
-      h += '<th class="seduta">' + (d.numero != null ? 'n. ' + esc(d.numero) : '—') +
-        '<small>' + esc(dataBreve(d)) + '</small></th>';
-    });
-    h += '<th>Pres.</th><th>Ass.</th><th>Cons.</th>';
-    if (opz.stato !== false) h += '<th>Stato</th>';
-    h += '</tr></thead><tbody>';
-
-    visibili.forEach(function (m) {
-      h += '<tr><td class="nome">' + esc(m.nome);
-      var sotto = [];
-      if (m.ruolo) sotto.push(m.ruolo);
-      if (m.cessato) sotto.push('cessato dal ' + (m.cessato.dataLabel || m.cessato.data));
-      if (sotto.length) h += '<small>' + esc(sotto.join(' · ')) + '</small>';
-      h += '</td>';
-      p.conTabella.forEach(function (d) {
-        var st = m.stati[d.nome];
-        var corretta = statoPresenze().correzioni[d.nome + '||' + m.chiave] ? ' corretta' : '';
-        var lab = st === 'presente' ? 'P' : (st === 'assente' ? 'A' : '–');
-        var cl = st === 'presente' ? 'p' : (st === 'assente' ? 'a' : 'v');
-        h += '<td class="' + cl + corretta + '">' + lab + '</td>';
-      });
-      h += '<td>' + m.totPresenze + '</td><td>' + m.totAssenze + '</td><td>' + (m.serie || '') + '</td>';
-      if (opz.stato !== false) {
-        var st = '—';
-        if (m.livello === 'rosso') st = 'oltre 2 ass. consec.';
-        else if (m.livello === 'arancione') st = '2 ass. consecutive';
-        else if (m.livello === 'chiuso') st = 'decaduto';
-        else if (m.livello === 'cessato') st = 'cessato';
-        h += '<td class="stato-cella">' + esc(st) + '</td>';
-      }
-      h += '</tr>';
-    });
-
-    if (opz.totali !== false) {
-      h += '<tr class="totali"><td class="nome">Presenti per seduta</td>';
-      p.conTabella.forEach(function (d) {
-        var n = 0;
-        visibili.forEach(function (m) { if (m.stati[d.nome] === 'presente') n++; });
-        h += '<td>' + n + '</td>';
-      });
-      h += '<td colspan="' + (opz.stato !== false ? 4 : 3) + '"></td></tr>';
-    }
-    h += '</tbody></table></div>';
-
-    if (opz.legenda !== false) {
-      h += '<div class="legenda"><strong>P</strong> presente · <strong>A</strong> assente · ' +
-        '<strong>–</strong> non risulta negli elenchi di quella seduta · ' +
-        '<strong>•</strong> dato corretto a mano rispetto all\'estrazione automatica. ' +
-        'La colonna «Cons.» riporta le assenze consecutive in corso alla data dell\'ultima seduta.';
-      if (p.senzaTabella.length) {
-        h += '<br>' + p.senzaTabella.length +
-          (p.senzaTabella.length === 1 ? ' verbale non ha' : ' verbali non hanno') +
-          ' una tabella delle presenze riconosciuta e non compare nel prospetto: ' +
-          esc(p.senzaTabella.map(etichettaSeduta).join(' · ')) + '.';
-      }
-      if (!opz.cessati && p.cessati.length) {
-        h += '<br>' + p.cessati.length +
-          (p.cessati.length === 1 ? ' componente cessato dal mandato non compare' : ' componenti cessati dal mandato non compaiono') +
-          ' nel prospetto.';
-      }
-      if (p.dataInizio) {
-        h += '<br>Il prospetto ha inizio dalla seduta del ' + esc(itData(p.dataInizio)) + '.';
-        if (p.anteriori.length) {
-          h += ' ' + (p.anteriori.length === 1
-            ? 'Una seduta anteriore, conservata nell\'archivio, non concorre al conteggio: '
-            : p.anteriori.length + ' sedute anteriori, conservate nell\'archivio, non concorrono al conteggio: ') +
-            esc(p.anteriori.map(etichettaSeduta).join(' · ')) + '.';
-        }
-      }
-      h += '</div>';
-    }
-
-    if (opz.segnalazioni !== false) {
-      var segnalati = p.membri.filter(function (m) {
-        return (m.livello === 'rosso' || m.livello === 'arancione' || m.livello === 'chiuso') &&
-          (opz.cessati || !m.cessato);
-      });
-      if (segnalati.length) {
-        h += '<div class="segnalazioni"><strong>Assenze consecutive da segnalare</strong><ul>';
-        segnalati.forEach(function (m) {
-          var r = esc(m.nome) + ' — ';
-          if (m.livello === 'rosso') r += m.serieMax + ' assenze consecutive';
-          else if (m.livello === 'arancione') r += 'due assenze consecutive in corso';
-          else r += 'decadenza registrata';
-          if (m.serieRossa && m.serieRossa.length) {
-            r += ' (sedute ' + esc(m.serieRossa.map(etichettaSeduta).join(' · ')) + ')';
-          } else if (m.livello === 'arancione' && m.primaDellaSerie) {
-            r += ' (dalla seduta ' + esc(etichettaSeduta(m.primaDellaSerie)) + ')';
-          }
-          if (m.decadenza) {
-            r += ' · decadenza dichiarata con delibera n. ' + esc(m.decadenza.delibera) +
-              (m.decadenza.data ? ' del ' + esc(m.decadenza.data) : '');
-          }
-          h += '<li>' + r + '.</li>';
-        });
-        h += '</ul></div>';
-      }
-    }
-    return h + '</div>';
-  }
-
-  /* ------------------------------------------------- foglio completo */
-
-  function bloccoVoce(v, opzGen) {
-    if (v.tipo === 'presenze') return bloccoPresenze(v, opzGen);
-    if (v.tipo === 'delibera') return bloccoDelibera(v, opzGen);
-    if (v.tipo === 'punto') return bloccoPunto(v, opzGen);
-    if (v.tipo === 'odg') return bloccoOdg(v, opzGen);
-    if (v.tipo === 'ricerca') return bloccoRicerca(v, opzGen);
-    if (v.tipo === 'nota') return bloccoNota(v);
-    return '';
-  }
-
-  function componiFoglio(voci, opzGen) {
-    var proprio = (stato.intestazione.titolo || '').trim();
-    var titolo = proprio || titoloPredefinito(voci);
-    var nota = (stato.intestazione.nota || '').trim();
-    opzGen.unico = (voci.length === 1 && !proprio);
-
-    var h = '<div class="doc-stampa"><div class="intestazione-foglio">';
-    h += '<div class="ente">Liceo Scientifico Statale «Nicolò Palmeri» · Termini Imerese</div>';
-    h += '<div class="organo">Consiglio d\'Istituto</div>';
-    h += '<h1>' + esc(titolo) + '</h1>';
-    h += '<div class="sottotitolo-foglio">Estratto dall\'archivio dei verbali · ' + esc(dataEstesa()) + '</div>';
-    h += '</div>';
-    if (nota) h += '<div class="nota-intestazione">' + esc(nota).replace(/\n/g, '<br>') + '</div>';
-
-    voci.forEach(function (v) { h += bloccoVoce(v, opzGen); });
-
-    h += '<div class="piede-foglio"><span>Archivio dei verbali del Consiglio d\'Istituto · ' +
-      'documento generato il ' + esc(dataEstesa()) + '</span>' +
-      '<span>Il documento riporta stralci dei verbali approvati; fa fede il testo originale.</span></div>';
-    return h + '</div>';
-  }
-
-  function titoloPredefinito(voci) {
-    if (voci.length === 1) {
-      var v = voci[0];
-      if (v.tipo === 'presenze') return 'Prospetto delle presenze';
-      if (v.tipo === 'delibera') return 'Delibera n. ' + (v.idDelibera || '');
-      if (v.tipo === 'odg') {
-        var d = docPerNome(v.nome);
-        return 'Ordine del giorno · ' + (d ? etichettaVerbale(d) : '');
-      }
-      if (v.tipo === 'ricerca') return 'Stralci dei verbali';
-      if (v.tipo === 'punto') return 'Stralcio del verbale';
-    }
-    return 'Estratto dai verbali del Consiglio d\'Istituto';
-  }
-
-  /* --------------------------------------------- anteprima e stampa */
-
-  /* Quanti pixel misura un millimetro sullo schermo: serve a confrontare
-     l'altezza del foglio composto con quella della pagina stampabile. */
-  function pixelPerMm() {
-    var probe = document.createElement('div');
-    probe.style.cssText = 'position:absolute;visibility:hidden;height:100mm;width:1mm';
-    document.body.appendChild(probe);
-    var r = probe.offsetHeight / 100;
-    document.body.removeChild(probe);
-    return r || 3.7795;
-  }
-
-  function regolaPagina(orientamento) {
-    var s = document.getElementById('regola-pagina');
-    if (!s) {
-      s = document.createElement('style');
-      s.id = 'regola-pagina';
-      document.head.appendChild(s);
-    }
-    s.textContent = '@page { size: A4 ' +
-      (orientamento === 'verticale' ? 'portrait' : 'landscape') +
-      '; margin: ' + MARGINE_MM + 'mm; }';
-  }
-
-  /* Una tabella con molte sedute puo' eccedere la larghezza della pagina.
-     Se ne riduce dapprima il corpo tipografico; se ancora non basta, si
-     rimpicciolisce la sola tabella, lasciando intatto il resto del foglio:
-     una riduzione dell'intero documento ne comprometterebbe l'impaginazione
-     su piu' pagine. Restituisce la riduzione minima applicata. */
-  function adattaTabelle(interno, disponibile) {
-    var minimo = 1;
-    Array.prototype.forEach.call(interno.querySelectorAll('table.prospetto'), function (t) {
-      t.style.fontSize = '';
-      t.style.transform = '';
-      var corpo = 8;
-      for (var i = 0; i < 14 && t.offsetWidth > disponibile + 1 && corpo > 4.4; i++) {
-        corpo -= 0.3;
-        t.style.fontSize = corpo.toFixed(1) + 'pt';
-      }
-      if (t.offsetWidth > disponibile + 1) {
-        var k = disponibile / t.offsetWidth;
-        t.style.transform = 'scale(' + k.toFixed(4) + ')';
-        var cont = t.parentNode;
-        if (cont && cont.className === 'riquadro-tabella') {
-          cont.style.height = Math.ceil(t.offsetHeight * k) + 'px';
-          cont.style.overflow = 'hidden';
-        }
-        if (k < minimo) minimo = k;
-      }
-    });
-    return minimo;
-  }
-
-  function apriAnteprima(voci, opzioni) {
-    if (!voci.length) { messaggio('Non vi è nulla da stampare.'); return; }
-    stato.stampa = { voci: voci, opz: opzioni };
-    el('st-orientamento').value = opzioni.orientamento || 'orizzontale';
-    el('st-una-pagina').checked = opzioni.unaPagina !== false;
-    el('st-evidenzia').checked = opzioni.evidenzia !== false;
-    el('velo-stampa').hidden = false;
-    document.body.classList.add('stampa-attiva');
-    componiAnteprima();
-  }
-
-  function chiudiAnteprima() {
-    el('velo-stampa').hidden = true;
-    document.body.classList.remove('stampa-attiva');
-    stato.stampa = null;
-  }
-
-  /* Sullo schermo del telefono il foglio, largo quanto la pagina A4, viene
-     ridotto fino a rientrare nella larghezza disponibile. La riduzione vale
-     soltanto per la visualizzazione: in stampa il foglio conserva la misura
-     reale, perché la regola CSS che la applica è limitata allo schermo. */
-  function componiAnteprima() {
-    var foglio = el('foglio');
-    if (foglio) foglio.style.setProperty('--zoom-anteprima', '1');
-    componiAnteprimaBase();
-    adattaAnteprimaAlloSchermo();
-  }
-
-  function adattaAnteprimaAlloSchermo() {
-    var foglio = el('foglio'), area = foglio ? foglio.parentNode : null;
-    if (!foglio || !area || el('velo-stampa').hidden) return;
-    foglio.style.setProperty('--zoom-anteprima', '1');
-    var cs = getComputedStyle(area);
-    var disponibile = area.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-    var largo = foglio.offsetWidth;
-    var z = largo > disponibile && disponibile > 0 ? disponibile / largo : 1;
-    foglio.style.setProperty('--zoom-anteprima', z.toFixed(4));
-  }
-
-  window.addEventListener('resize', function () { adattaAnteprimaAlloSchermo(); });
-
-  function componiAnteprimaBase() {
-    if (!stato.stampa) return;
-    var o = stato.stampa.opz;
-    o.orientamento = el('st-orientamento').value;
-    o.unaPagina = el('st-una-pagina').checked;
-    o.evidenzia = el('st-evidenzia').checked;
-    regolaPagina(o.orientamento);
-
-    var larghMm = (o.orientamento === 'verticale' ? 210 : 297) - 2 * MARGINE_MM;
-    var altMm = (o.orientamento === 'verticale' ? 297 : 210) - 2 * MARGINE_MM;
-    var mm = pixelPerMm();
-
-    var foglio = el('foglio'), interno = el('foglio-interno');
-    foglio.style.width = larghMm + 'mm';
-    foglio.style.height = '';
-    foglio.style.minHeight = altMm + 'mm';
-    interno.style.width = larghMm + 'mm';
-    interno.style.transform = 'none';
-    interno.innerHTML = componiFoglio(stato.stampa.voci, o);
-
-    var avviso = el('st-avviso');
-    avviso.textContent = '';
-
-    /* Un paio di pixel di margine: il foglio non deve traboccare sulla
-       pagina seguente per un arrotondamento. */
-    var spazioAlto = altMm * mm - 3;
-    var spazioLargo = larghMm * mm;
-    var kTabella = adattaTabelle(interno, spazioLargo);
-
-    var alt = interno.scrollHeight;
-    var k = 1;
-    if (o.unaPagina && alt > spazioAlto) k = spazioAlto / alt;
-
-    if (k < SCALA_MINIMA) {
-      k = SCALA_MINIMA;
-      avviso.textContent = 'Il contenuto eccede la pagina anche alla riduzione massima: ' +
-        'converrà l\'orientamento orizzontale, oppure meno elementi nella raccolta.';
-    }
-
-    /* La riduzione si applica al solo caso della pagina unica: in un
-       documento di piu' pagine il contenuto rimpicciolito non si
-       ripartirebbe correttamente fra le pagine. */
-    foglio.classList.toggle('ritagliato', k < 1);
-    if (k < 1) {
-      interno.style.transform = 'scale(' + k.toFixed(4) + ')';
-      foglio.style.height = Math.ceil(alt * k) + 'px';
-      foglio.style.minHeight = '0';
-      if (!avviso.textContent && k < 0.8) {
-        avviso.textContent = 'Il contenuto è stato ridotto al ' + Math.round(k * 100) +
-          '% per rientrare in una pagina.';
-      }
-    } else if (o.unaPagina) {
-      foglio.style.height = Math.ceil(spazioAlto) + 'px';
-    } else {
-      foglio.style.height = '';
-      foglio.style.minHeight = altMm + 'mm';
-      /* Stima per difetto: un blocco che non sta nello spazio residuo passa
-         intero alla pagina seguente, e le pagine possono risultare di piu'. */
-      var pagine = Math.max(1, Math.ceil(alt / spazioAlto - 0.02));
-      if (pagine > 1) avviso.textContent = 'Il documento occuperà all\'incirca ' + pagine + ' pagine.';
-    }
-
-    if (kTabella < 1 && !avviso.textContent) {
-      avviso.textContent = 'Il prospetto è stato ridotto al ' + Math.round(kTabella * 100) +
-        '% per rientrare nella larghezza della pagina: l\'orientamento orizzontale lo rende più leggibile.';
-    }
-  }
-
-  /* Il titolo della pagina diventa il nome proposto dal browser per il
-     file PDF: conviene che sia quello del documento composto. */
-  function stampaFoglio() {
-    if (!stato.stampa) return;
-    var titoloPrecedente = document.title;
-    var t = (stato.intestazione.titolo || '').trim() || titoloPredefinito(stato.stampa.voci);
-    document.title = t + ' - Consiglio d\'Istituto - Liceo Palmeri';
-    function ripristina() {
-      document.title = titoloPrecedente;
-      window.removeEventListener('afterprint', ripristina);
-    }
-    window.addEventListener('afterprint', ripristina);
-    setTimeout(function () { window.print(); }, 60);
-    setTimeout(ripristina, 8000);
-  }
-
-  /* Stampa immediata del solo prospetto delle presenze, senza passare
-     dalla raccolta: e' l'uso piu' frequente. */
-  function stampaProspettoPresenze() {
-    var p = calcolaPresenze();
-    if (!p.conTabella.length) {
-      alert('Non risulta alcuna tabella delle presenze nei verbali indicizzati: non vi è prospetto da stampare.');
-      return;
-    }
-    apriAnteprima([{
-      id: 'tmp', tipo: 'presenze',
-      opz: { cessati: !!stato.mostraCessati, segnalazioni: true, totali: true, legenda: true }
-    }], { orientamento: 'orizzontale', unaPagina: true, evidenzia: false });
-  }
-
-  /* ------------------------------------------- scheda «Da condividere» */
-
-  function descriviVoce(v) {
-    var d = v.nome ? docPerNome(v.nome) : null;
-    var sez = d ? sezioneDi(d, v.sez) : null;
-    if (v.tipo === 'presenze') {
-      return { titolo: 'Prospetto delle presenze',
-        sommario: 'Tabella dei componenti per seduta, con le assenze consecutive da segnalare.' };
-    }
-    if (v.tipo === 'delibera') {
-      return { titolo: 'Delibera n. ' + (v.idDelibera || ''),
-        sommario: (d ? riferimentoVerbale(d, sez) : v.nome) + (sez && sez.titolo ? ' — ' + sez.titolo : '') };
-    }
-    if (v.tipo === 'punto') {
-      return { titolo: (sez && sez.punto ? 'Punto ' + sez.punto + ' o.d.g. — ' : 'Stralcio — ') +
-          (sez ? (sez.titolo || sez.intestazione || 'parte accessoria') : ''),
-        sommario: d ? riferimentoVerbale(d, null) : v.nome };
-    }
-    if (v.tipo === 'odg') {
-      return { titolo: 'Ordine del giorno · ' + (d ? etichettaVerbale(d) : v.nome),
-        sommario: d && d.dataLabel ? 'Seduta del ' + d.dataLabel : v.nome };
-    }
-    if (v.tipo === 'ricerca') {
-      return { titolo: 'Stralci della ricerca' + (v.ricerca ? ' «' + v.ricerca.q + '»' : ''),
-        sommario: v.elementi.length + (v.elementi.length === 1 ? ' punto' : ' punti') +
-          ' di ' + contaVerbaliRicerca(v) + ' verbali, come restituiti dalla ricerca.' };
-    }
-    if (v.tipo === 'nota') {
-      return { titolo: 'Nota libera', sommario: 'Testo redatto a mano, riportato nel documento.' };
-    }
-    return { titolo: '—', sommario: '' };
-  }
-
-  function contaVerbaliRicerca(v) {
-    var s = {}, n = 0;
-    v.elementi.forEach(function (e) { if (!s[e.nome]) { s[e.nome] = 1; n++; } });
-    return n;
-  }
-
-  function disegnaCondivisione() {
-    var vista = el('vista-condivisione');
-    if (!vista) return;
-    aggiornaContatoreRaccolta();
-
-    var h = '';
-    /* L'intestazione del documento viene dopo l'elenco delle voci raccolte:
-       sotto la barra delle schede sta ciò che la scheda contiene. */
-    var intestazione = '<div class="riquadro" style="margin-top:14px"><h3>Documento da condividere</h3>' +
-      '<p>Gli elementi raccolti nelle altre schede vengono composti in un unico documento, ' +
-      'che si stampa oppure si salva in PDF scegliendo «Salva come PDF» fra le destinazioni ' +
-      'della finestra di stampa.</p>' +
-      '<div class="intestazione-raccolta">' +
-      '<div class="campo-largo"><label for="int-titolo">Titolo del documento</label>' +
-      '<input id="int-titolo" type="text" placeholder="' + esc(titoloPredefinito(stato.raccolta)) + '" value="' +
-      esc(stato.intestazione.titolo || '') + '"></div>' +
-      '<div class="campo-largo"><label for="int-nota">Nota in apertura (facoltativa)</label>' +
-      '<input id="int-nota" type="text" placeholder="Si trasmette, per quanto di competenza, …" value="' +
-      esc(stato.intestazione.nota || '') + '"></div>' +
-      '</div></div>';
-
-    if (!stato.raccolta.length) {
-      h += '<div class="vuoto"><span class="grande">La raccolta è vuota</span>' +
-        'Il comando <strong>Aggiungi alla raccolta</strong> compare accanto a ciascun risultato di ricerca, ' +
-        'a ciascuna delibera, all\'ordine del giorno di ogni verbale e al prospetto delle presenze.<br>' +
-        'Gli elementi raccolti si ritrovano qui, in questa scheda, e vi restano anche dopo la chiusura del programma.</div>';
-      h += '<div class="azioni-punto"><button class="bottone minuto" data-aggiungi-nota="1">Aggiungi una nota libera</button>' +
-        '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto delle presenze</button></div>';
-      vista.innerHTML = h;
-      agganciaCampiRaccolta();
-      return;
-    }
-
-    h += '<div class="riepilogo">' + stato.raccolta.length +
-      (stato.raccolta.length === 1 ? ' elemento nella raccolta' : ' elementi nella raccolta') +
-      '. L\'ordine è quello del documento.</div>';
-
-    stato.raccolta.forEach(function (v, i) {
-      var des = descriviVoce(v);
-      h += '<div class="voce-raccolta">';
-      h += '<div class="riga-ordine"><span class="indice-voce">' + (i + 1) + '.</span>' +
-        '<button class="bottone minuto" data-su="' + esc(v.id) + '"' + (i === 0 ? ' disabled' : '') + ' title="Sposta in su">↑</button>' +
-        '<button class="bottone minuto" data-giu="' + esc(v.id) + '"' + (i === stato.raccolta.length - 1 ? ' disabled' : '') + ' title="Sposta in giù">↓</button>' +
-        '<button class="bottone minuto pericolo" data-togli="' + esc(v.id) + '">Togli</button>';
-      if (v.nome) {
-        h += '<button class="bottone minuto" data-apri="' + esc(v.nome) + '">Apri il verbale</button>';
-      }
-      h += '</div>';
-      h += '<div class="titolo-voce">' + esc(des.titolo) + '</div>';
-      h += '<div class="sommario-voce">' + esc(des.sommario) + '</div>';
-
-      if (v.tipo === 'nota') {
-        h += '<textarea data-testo-nota="' + esc(v.id) + '" placeholder="Prima riga: titolo del paragrafo. Righe successive: il testo.">' +
-          esc(v.testo || '') + '</textarea>';
-      }
-      h += '<div class="opzioni-voce">';
-      if (v.tipo === 'punto' || v.tipo === 'ricerca') {
-        h += '<label><input type="checkbox" data-opz="integrale" data-voce="' + esc(v.id) + '"' +
-          (v.opz.integrale ? ' checked' : '') + '> testo integrale ' +
-          (v.tipo === 'ricerca' ? 'dei punti' : 'del punto') + ', non i soli passaggi trovati</label>';
-        if (v.ricerca) {
-          h += '<label><input type="checkbox" data-opz="evidenzia" data-voce="' + esc(v.id) + '"' +
-            (v.opz.evidenzia !== false ? ' checked' : '') + '> evidenzia i termini cercati</label>';
-        }
-      }
-      if (v.tipo === 'delibera') {
-        h += '<label><input type="checkbox" data-opz="sviluppo" data-voce="' + esc(v.id) + '"' +
-          (v.opz.sviluppo !== false ? ' checked' : '') + '> con lo sviluppo del punto all\'ordine del giorno</label>';
-      }
-      if (v.tipo === 'odg') {
-        h += '<label><input type="checkbox" data-opz="delibere" data-voce="' + esc(v.id) + '"' +
-          (v.opz.delibere !== false ? ' checked' : '') + '> indica le delibere adottate su ciascun punto</label>';
-      }
-      if (v.tipo === 'presenze') {
-        h += '<label><input type="checkbox" data-opz="cessati" data-voce="' + esc(v.id) + '"' +
-          (v.opz.cessati ? ' checked' : '') + '> comprendi i componenti cessati dal mandato</label>';
-        h += '<label><input type="checkbox" data-opz="segnalazioni" data-voce="' + esc(v.id) + '"' +
-          (v.opz.segnalazioni !== false ? ' checked' : '') + '> elenca le assenze consecutive da segnalare</label>';
-        h += '<label><input type="checkbox" data-opz="totali" data-voce="' + esc(v.id) + '"' +
-          (v.opz.totali !== false ? ' checked' : '') + '> riga dei presenti per seduta</label>';
-        h += '<label><input type="checkbox" data-opz="stato" data-voce="' + esc(v.id) + '"' +
-          (v.opz.stato !== false ? ' checked' : '') + '> colonna dello stato</label>';
-      }
-      h += '</div></div>';
-    });
-
-    h += '<div class="azioni-punto" style="margin-top:14px">' +
-      '<button class="bottone primario" data-anteprima="1">Anteprima e stampa (PDF)</button>' +
-      '<button class="bottone minuto" data-aggiungi-nota="1">Aggiungi una nota libera</button>' +
-      '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto delle presenze</button>' +
-      '<button class="bottone minuto pericolo" data-svuota-raccolta="1">Svuota la raccolta</button>' +
-      '</div>';
-
-    h += intestazione;
-
-    vista.innerHTML = h;
-    agganciaCampiRaccolta();
-  }
-
-  /* I campi di testo si aggiornano senza ridisegnare la scheda, perché il
-     ridisegno interromperebbe la digitazione. */
-  function agganciaCampiRaccolta() {
-    var t = el('int-titolo'), n = el('int-nota');
-    if (t) t.addEventListener('input', function () { stato.intestazione.titolo = this.value; salvaRaccolta(); });
-    if (n) n.addEventListener('input', function () { stato.intestazione.nota = this.value; salvaRaccolta(); });
-    Array.prototype.forEach.call(document.querySelectorAll('[data-testo-nota]'), function (ta) {
-      ta.addEventListener('input', function () {
-        var v = vocePerId(this.dataset.testoNota);
-        if (v) { v.testo = this.value; salvaRaccolta(); }
-      });
-    });
-  }
-
-  function anteprimaRaccolta() {
-    if (!stato.raccolta.length) { messaggio('La raccolta è vuota.'); return; }
-    var soloPresenze = stato.raccolta.length === 1 && stato.raccolta[0].tipo === 'presenze';
-    /* Il prospetto delle presenze e' largo: quando fa parte della raccolta
-       si propone l'orientamento orizzontale, che lo rende leggibile. */
-    var conProspetto = stato.raccolta.some(function (v) { return v.tipo === 'presenze'; });
-    apriAnteprima(stato.raccolta, {
-      orientamento: conProspetto ? 'orizzontale' : 'verticale',
-      unaPagina: soloPresenze,
-      evidenzia: true
-    });
-  }
-
-  /* Eventi della raccolta e dell'anteprima: si agganciano una sola volta. */
-  function agganciaEventiStampa() {
-    el('st-orientamento').addEventListener('change', componiAnteprima);
-    el('st-una-pagina').addEventListener('change', componiAnteprima);
-    el('st-evidenzia').addEventListener('change', componiAnteprima);
-    el('st-stampa').addEventListener('click', stampaFoglio);
-    el('st-chiudi').addEventListener('click', chiudiAnteprima);
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && !el('velo-stampa').hidden) chiudiAnteprima();
-    });
-
-    document.addEventListener('click', function (e) {
-      var sel = '[data-raccogli-punto],[data-raccogli-delibera],[data-raccogli-odg],' +
-        '[data-raccogli-presenze],[data-raccogli-ricerca],[data-stampa-presenze],' +
-        '[data-su],[data-giu],[data-togli],[data-anteprima],[data-svuota-raccolta],[data-aggiungi-nota]';
-      var b = e.target.closest ? e.target.closest(sel) : null;
-      if (!b) return;
-      e.stopPropagation();
-
-      if (b.dataset.raccogliPunto) {
-        var par = [];
-        try { par = JSON.parse(b.dataset.paragrafi || '[]'); } catch (x) { par = []; }
-        raccogliPunto(b.dataset.raccogliPunto, parseInt(b.dataset.sez, 10), par);
-      } else if (b.dataset.raccogliDelibera) {
-        raccogliDelibera(b.dataset.raccogliDelibera, parseInt(b.dataset.sez, 10), b.dataset.delibera);
-      } else if (b.dataset.raccogliOdg) {
-        raccogliOdg(b.dataset.raccogliOdg);
-      } else if (b.dataset.raccogliPresenze) {
-        raccogliPresenze();
-      } else if (b.dataset.raccogliRicerca) {
-        raccogliRicerca();
-      } else if (b.dataset.stampaPresenze) {
-        stampaProspettoPresenze();
-      } else if (b.dataset.su) {
-        spostaVoce(b.dataset.su, -1);
-      } else if (b.dataset.giu) {
-        spostaVoce(b.dataset.giu, 1);
-      } else if (b.dataset.togli) {
-        rimuoviVoce(b.dataset.togli);
-      } else if (b.dataset.anteprima) {
-        anteprimaRaccolta();
-      } else if (b.dataset.aggiungiNota) {
-        aggiungiVoce({ tipo: 'nota', testo: '', firma: 'n' + Date.now(), opz: {} }, 'Nota aggiunta');
-      } else if (b.dataset.svuotaRaccolta) {
-        if (!confirm('Togliere dalla raccolta tutti gli elementi?')) return;
-        stato.raccolta = [];
-        salvaRaccolta();
-        aggiornaContatoreRaccolta();
-        disegnaCondivisione();
-      }
-    });
-
-    document.addEventListener('change', function (e) {
-      var t = e.target;
-      if (!t || !t.dataset || !t.dataset.opz) return;
-      var v = vocePerId(t.dataset.voce);
-      if (!v) return;
-      v.opz[t.dataset.opz] = t.checked;
-      salvaRaccolta();
-      disegnaCondivisione();
-    });
-  }
-
-  /* Comando di raccolta da apporre alle schede dei risultati. */
-  function bottoneRaccolta(attributi, etichetta) {
-    return '<button class="bottone minuto" ' + attributi + '>' + etichetta + '</button>';
-  }
-
-
-  /* ------------------------------------------------------------- eventi */
-
-  function agganciaEventi() {
-    var timer = null;
-    el('q').addEventListener('input', function () {
-      el('btn-pulisci').hidden = !this.value;
-      clearTimeout(timer);
-      timer = setTimeout(cerca, 220);
-    });
-    el('q').addEventListener('keydown', function (e) {
-      if (e.key === 'Enter') { clearTimeout(timer); cerca(); }
-    });
-    el('btn-cerca').addEventListener('click', cerca);
-    el('btn-pulisci').addEventListener('click', function () {
-      el('q').value = ''; this.hidden = true; stato.ultimaRicerca = null; disegnaRisultati(null); el('q').focus();
-    });
-
-    ['opt-prefisso', 'opt-ambito', 'opt-ordine', 'opt-solo-delibere'].forEach(function (id) {
-      el(id).addEventListener('change', cerca);
-    });
-    Array.prototype.forEach.call(document.querySelectorAll('input[name=modo]'), function (r) {
-      r.addEventListener('change', function () { aggiornaModo(); cerca(); });
-    });
-
-    // schede
-    Array.prototype.forEach.call(document.querySelectorAll('.scheda'), function (b) {
-      b.addEventListener('click', function () {
-        Array.prototype.forEach.call(document.querySelectorAll('.scheda'), function (x) { x.classList.remove('attiva'); });
-        b.classList.add('attiva');
-        ['risultati', 'verbali', 'delibere', 'presenze', 'condivisione', 'cestino', 'diagnostica'].forEach(function (v) {
-          el('vista-' + v).hidden = (v !== b.dataset.scheda);
-        });
-        /* I comandi di caricamento e di aggiornamento appartengono alla
-           gestione dell'archivio e compaiono soltanto nella scheda Verbali,
-           in testa all'elenco dei file. La testata ospita la sola barra
-           delle schede, oltre al menu delle altre azioni. */
-        el('azioni-verbali').hidden = (b.dataset.scheda !== 'verbali');
-      });
-    });
-
-    // menu
-    el('btn-altro').addEventListener('click', function (e) {
-      e.stopPropagation();
-      el('menu-altro').hidden = !el('menu-altro').hidden;
-    });
-    document.addEventListener('click', function () { el('menu-altro').hidden = true; });
-    el('menu-altro').addEventListener('click', function (e) {
-      var a = e.target.dataset.azione;
-      if (!a) return;
-      el('menu-altro').hidden = true;
-      if (a === 'cerca') { apriRicerca(); return; }
-      if (a === 'reindicizza') {
-        if (!confirm('Ricostruire l\'indice leggendo da capo tutti i verbali? L\'operazione può richiedere qualche minuto.')) return;
-        costruisciIndice(true).then(ridisegnaTutto);
-      } else if (a === 'cartella') {
-        fetch('/api/apri', { method: 'POST' });
-      } else if (a === 'esporta') {
-        var blob = new Blob([csvDelibere()], { type: 'text/csv;charset=utf-8' });
-        var url = URL.createObjectURL(blob);
-        var link = document.createElement('a');
-        link.href = url; link.download = 'Indice delibere Consiglio d\'Istituto.csv';
-        document.body.appendChild(link); link.click(); document.body.removeChild(link);
-        setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
-      } else if (a === 'stampa-presenze') {
-        stampaProspettoPresenze();
-      } else if (a === 'raccolta') {
-        var sc = document.querySelector('.scheda[data-scheda="condivisione"]');
-        if (sc) { sc.click(); sc.scrollIntoView({ block: 'nearest' }); }
-      } else if (a === 'impostazioni') {
-        if (window.ArchivioGitHub) window.ArchivioGitHub.impostazioni();
-      }
-    });
-
-    el('btn-aggiorna').addEventListener('click', function () {
-      costruisciIndice(false).then(function (n) {
-        ridisegnaTutto();
-        if (!n) alert('Nessun verbale nuovo o modificato: l\'indice è già aggiornato.');
-      });
-    });
-
-    // caricamento
-    el('btn-carica').addEventListener('click', function () { el('file-input').click(); });
-    el('file-input').addEventListener('change', function () {
-      if (this.files && this.files.length) caricaFiles(this.files);
-      this.value = '';
-    });
-
-    var contatoreDrag = 0;
-    window.addEventListener('dragenter', function (e) {
-      if (!e.dataTransfer || Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') < 0) return;
-      contatoreDrag++; el('zona-trascinamento').hidden = false;
-    });
-    window.addEventListener('dragleave', function () {
-      contatoreDrag--; if (contatoreDrag <= 0) { contatoreDrag = 0; el('zona-trascinamento').hidden = true; }
-    });
-    window.addEventListener('dragover', function (e) { e.preventDefault(); });
-    window.addEventListener('drop', function (e) {
-      e.preventDefault(); contatoreDrag = 0; el('zona-trascinamento').hidden = true;
-      if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) caricaFiles(e.dataTransfer.files);
-    });
-
-    // azioni delegate
-    document.addEventListener('click', function (e) {
-      var sel = '[data-apri],[data-cartella],[data-riga],[data-rimuovi],[data-ripristina],[data-elimina],' +
-        '[data-apri-cestino],[data-espandi],[data-cella],[data-silenzia],[data-apri-decadenza],' +
-        '[data-salva-decadenza],[data-revoca-decadenza],[data-scheda-vai],' +
-        '[data-apri-cessazione],[data-salva-cessazione],[data-revoca-cessazione],' +
-        '[data-apri-esclusione],[data-salva-esclusione],[data-reintegra],' +
-        '[data-salva-inizio],[data-azzera-inizio],[data-apri-ricerca]';
-      var b = e.target.closest ? e.target.closest(sel) : null;
-      if (!b) return;
-
-      if (b.dataset.schedaVai) {
-        var t = document.querySelector('.scheda[data-scheda="' + b.dataset.schedaVai + '"]');
-        if (t) { t.click(); t.scrollIntoView({ block: 'nearest' }); }
-        return;
-      }
-      if (b.dataset.apriCessazione) {
-        var campoData = el('data-cessazione');
-        stato.bozzaDataCessazione = campoData ? campoData.value : '';
-        memorizzaBozzaInizio();
-        stato.pannelloCessazione = !stato.pannelloCessazione;
-        disegnaPresenze();
-        var nuovo = el('data-cessazione');
-        if (nuovo) nuovo.focus();
-        return;
-      }
-      if (b.dataset.salvaCessazione) { registraCessazione(); return; }
-      if (b.dataset.revocaCessazione) { revocaCessazione(b.dataset.revocaCessazione); return; }
-      if (b.dataset.apriEsclusione) {
-        memorizzaBozzaInizio();
-        stato.pannelloEsclusione = !stato.pannelloEsclusione;
-        disegnaPresenze();
-        return;
-      }
-      if (b.dataset.apriRicerca) { apriRicerca(true); return; }
-      if (b.dataset.salvaInizio) { registraInizioMonitoraggio(); return; }
-      if (b.dataset.azzeraInizio) { azzeraInizioMonitoraggio(false); return; }
-      if (b.dataset.salvaEsclusione) { registraEsclusione(); return; }
-      if (b.dataset.reintegra) { reintegraEscluso(parseInt(b.dataset.reintegra, 10)); return; }
-      if (b.dataset.cella) { commutaCella(b.dataset.cella, b.dataset.chiave); return; }
-      if (b.dataset.silenzia) { commutaSilenzio(b.dataset.silenzia); return; }
-      if (b.dataset.revocaDecadenza) { revocaDecadenza(b.dataset.revocaDecadenza); return; }
-      if (b.dataset.apriDecadenza) {
-        var box = document.getElementById('dec-' + b.dataset.apriDecadenza.replace(/[^a-z0-9]/g, '-'));
-        if (box) { box.hidden = !box.hidden; if (!box.hidden) { var i = box.querySelector('input'); if (i) i.focus(); } }
-        return;
-      }
-      if (b.dataset.salvaDecadenza) {
-        var cont = b.closest('.modulo-decadenza');
-        var del = cont ? cont.querySelector('[data-campo=delibera]').value.trim() : '';
-        var dat = cont ? cont.querySelector('[data-campo=data]').value.trim() : '';
-        registraDecadenza(b.dataset.salvaDecadenza, del, dat);
-        return;
-      }
-
-      if (b.dataset.espandi) {
-        e.stopPropagation();
-        commutaEspansione(b);
-      } else if (b.dataset.apri) {
-        fetch('/api/apri?nome=' + encodeURIComponent(b.dataset.apri), { method: 'POST' });
-      } else if (b.dataset.cartella) {
-        fetch('/api/apri?nome=' + encodeURIComponent(b.dataset.cartella) + '&cartella=1', { method: 'POST' });
-      } else if (b.dataset.apriCestino) {
-        fetch('/api/apri?da=cestino&nome=' + encodeURIComponent(b.dataset.apriCestino), { method: 'POST' });
-      } else if (b.dataset.rimuovi) {
-        e.stopPropagation();
-        rimuoviVerbale(b.dataset.rimuovi);
-      } else if (b.dataset.ripristina) {
-        ripristinaVerbale(b.dataset.ripristina, b.dataset.orig || b.dataset.ripristina, false);
-      } else if (b.dataset.elimina) {
-        eliminaDalCestino(b.dataset.elimina, b.dataset.orig || b.dataset.elimina);
-      } else if (b.dataset.riga != null) {
-        var det = document.querySelector('[data-dettaglio="' + b.dataset.riga + '"]');
-        if (det) det.hidden = !det.hidden;
-      }
-    });
-
-    // casella che riporta in vista i componenti cessati
-    document.addEventListener('change', function (e) {
-      if (e.target && e.target.id === 'opt-mostra-cessati') {
-        stato.mostraCessati = e.target.checked;
-        disegnaPresenze();
-      }
-    });
-
-    document.addEventListener('keydown', function (e) {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); apriRicerca(true); }
-    });
-
-    agganciaTestataCompatta();
-  }
-
-  /* La testata resta agganciata in cima allo schermo. Appena la pagina si
-     muove viene ridotta, così da non sottrarre spazio alla lettura. Le due
-     soglie sono diverse di proposito: una sola soglia farebbe oscillare la
-     testata fra i due stati quando lo scorrimento si ferma sul confine. */
-  function agganciaTestataCompatta() {
-    var testata = document.querySelector('.testata');
-    if (!testata) return;
-    var atteso = false;
-    function valuta() {
-      atteso = false;
-      var y = window.pageYOffset || document.documentElement.scrollTop || 0;
-      var compatta = testata.classList.contains('compatta');
-      if (!compatta && y > 48) testata.classList.add('compatta');
-      else if (compatta && y < 24) testata.classList.remove('compatta');
-    }
-    window.addEventListener('scroll', function () {
-      if (atteso) return;
-      atteso = true;
-      window.requestAnimationFrame(valuta);
-    }, { passive: true });
-    valuta();
-  }
-
-  /* Il riquadro di ricerca sta chiuso e si apre dal menu delle azioni,
-     oppure con Ctrl+F. Aprendolo si passa alla scheda dei risultati, perché è
-     là che la ricerca si legge. */
-  function apriRicerca(forza) {
-    var r = el('pannello-ricerca');
-    if (!r) return;
-    var apri = forza === true ? true : r.hidden;
-    r.hidden = !apri;
-    if (!apri) return;
-    var t = document.querySelector('.scheda[data-scheda="risultati"]');
-    if (t && !t.classList.contains('attiva')) t.click();
-    window.scrollTo({ top: 0, behavior: 'auto' });
-    var q = el('q');
-    if (q) { q.focus(); q.select(); }
-  }
-
-  /* --------------------------------------------------------------- avvio */
-
-  function avvia() {
-    if (window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js';
-    agganciaEventi();
-    agganciaEventiStampa();
-    caricaRaccolta();
-    aggiornaContatoreRaccolta();
-    aggiornaModo();
-
-    chiediJson('/api/config').then(function (c) {
-      stato.config = c || {};
-      if (!stato.config.esiste) {
-        el('stato-archivio').hidden = false;
-        el('stato-archivio').innerHTML = '<span class="pill err">cartella non trovata</span>' +
-          '<span class="percorso">' + esc(stato.config.archivePath || '') + '</span>';
-        el('vista-risultati').innerHTML = '<div class="riquadro attenzione"><h3>La cartella dei verbali non è stata trovata</h3>' +
-          '<p>Il percorso configurato è:</p><p class="mono"><strong>' + esc(stato.config.archivePath) + '</strong></p>' +
-          '<p>Occorre aprire il file <strong>config.json</strong> nella cartella dell\'applicazione, ' +
-          'correggere la voce <em>ArchivePath</em> con il percorso effettivo e riavviare l\'archivio. ' +
-          'Nel percorso le barre rovesciate vanno raddoppiate, per esempio: ' +
-          '<span class="mono">C:\\\\Users\\\\giann\\\\Desktop\\\\...</span></p></div>';
-        return null;
-      }
-      return chiediJson('/api/indice');
-    }).then(function (idx) {
-      if (idx === null && (!stato.config || !stato.config.esiste)) return;
-      if (idx && idx.versione === VERSIONE_INDICE) stato.indice = idx;
-      return costruisciIndice(false)
-        .then(function () { return aggiornaCestino(); })
-        .then(function () {
-          return chiediJson('/api/presenze').then(function (pr) {
-            if (pr && pr.versione === VERSIONE_PRESENZE) stato.presenzeDati = pr;
-            /* La prima immissione dei valori predefiniti viene registrata nei
-               dati salvati, così che la scelta risieda nel repository e non
-               dipenda da una costante del codice: le installazioni successive
-               la trovano già fatta, e una eventuale rimozione da parte
-               dell'utente resta tale. */
-            statoPresenze();
-            if (!pr || !pr.inizioInizializzato) return salvaPresenze();
-          }).catch(function () { });
-        })
-        .then(ridisegnaTutto);
-    }).catch(function (e) {
-      velo(false);
-      el('stato-archivio').hidden = false;
-      el('stato-archivio').innerHTML = '<span class="pill err">errore di avvio</span><span class="percorso">' + esc(e.message) + '</span>';
-      console.error(e);
-    });
-  }
-
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', avvia);
-  else avvia();
-})();
+/* ===================================================================
+   Archivio verbali del Consiglio d'Istituto — foglio di stile
+   =================================================================== */
+
+:root {
+  --sfondo: #f6f6f4;
+  --carta: #ffffff;
+  --carta-2: #fbfbfa;
+  --testo: #1c1d1a;
+  --testo-tenue: #5e6158;
+  --testo-debole: #8a8d84;
+  --bordo: #e0e0db;
+  --bordo-forte: #c9cac3;
+  --accento: #1f4e79;
+  --accento-chiaro: #e6ecf0;
+  --accento-testo: #ffffff;
+  --evidenza: #fff2a8;
+  --evidenza-bordo: #e8d45f;
+  --allerta: #8a3324;
+  --allerta-sfondo: #fbeeeb;
+  --ok: #1f4e79;
+  --ombra: 0 1px 2px rgba(20, 22, 18, .05), 0 4px 14px rgba(20, 22, 18, .05);
+  --raggio: 10px;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sfondo: #14150f;
+    --carta: #1c1e18;
+    --carta-2: #22241d;
+    --testo: #e9eae2;
+    --testo-tenue: #a9ada0;
+    --testo-debole: #7d8176;
+    --bordo: #2f322a;
+    --bordo-forte: #454940;
+    --accento: #93bce4;
+    --accento-chiaro: #1b2735;
+    --accento-testo: #0d141c;
+    --evidenza: #5e5320;
+    --evidenza-bordo: #8d7c2c;
+    --allerta: #e8a294;
+    --allerta-sfondo: #32211d;
+    --ok: #93bce4;
+    --ombra: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 14px rgba(0, 0, 0, .25);
+  }
+}
+
+* { box-sizing: border-box; }
+
+/* Necessario: gli elementi con display flex ignorerebbero l'attributo hidden. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  background: var(--sfondo);
+  color: var(--testo);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
+
+/* ------------------------------------------------------------- testata */
+
+.testata {
+  background: var(--carta);
+  border-bottom: 1px solid var(--bordo);
+  padding: 16px 20px 0;
+  position: sticky;
+  top: 0;
+  z-index: 40;
+}
+
+/* Testata ridotta durante lo scorrimento. Restando agganciata in cima, la
+   testata sottrarrebbe altrimenti un quarto dello schermo del telefono: una
+   volta che la pagina si è mossa restano il titolo, i comandi e, se presenti,
+   le righe principali dell'avviso sulle assenze. */
+.testata.compatta { padding: 8px 20px 0; box-shadow: 0 2px 10px rgba(0, 0, 0, .07); }
+.testata.compatta .marchio-titolo { font-size: 16px; }
+.testata.compatta .avviso-presenze .lampeggio.secondo { margin-top: 0; }
+
+.testata-riga {
+  max-width: 1040px;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.marchio-titolo { font-family: var(--serif); font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
+.titolo-breve { display: none; }
+.marchio-sottotitolo { color: var(--testo-tenue); font-size: 12.5px; margin-top: 1px; }
+
+.azioni-testata { display: flex; gap: 8px; align-items: center; }
+
+/* Comandi dell'archivio, in testa alla sola scheda Verbali. */
+.azioni-verbali { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; }
+
+.stato-archivio {
+  max-width: 1040px;
+  margin: 14px auto 0;
+  font-size: 12.5px;
+  color: var(--testo-tenue);
+  font-family: var(--mono);
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.stato-archivio .pill {
+  background: var(--carta-2);
+  border: 1px solid var(--bordo);
+  border-radius: 999px;
+  padding: 1px 9px;
+}
+.stato-archivio .pill.err { background: var(--allerta-sfondo); border-color: var(--allerta); color: var(--allerta); }
+.stato-archivio .percorso { color: var(--testo-debole); overflow-wrap: anywhere; }
+
+/* -------------------------------------------------------------- bottoni */
+
+.bottone {
+  font: inherit;
+  font-size: 13.5px;
+  padding: 6px 13px;
+  border-radius: 7px;
+  border: 1px solid var(--bordo-forte);
+  background: var(--carta-2);
+  color: var(--testo);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background .12s, border-color .12s;
+}
+.bottone:hover { background: var(--accento-chiaro); border-color: var(--accento); }
+.bottone.primario { background: var(--accento); border-color: var(--accento); color: var(--accento-testo); font-weight: 550; }
+.bottone.primario:hover { filter: brightness(1.08); }
+.bottone.grande { padding: 9px 22px; font-size: 14.5px; }
+.bottone.solo-icona { padding: 6px 11px; font-size: 15px; line-height: 1; }
+.bottone.minuto { padding: 3px 9px; font-size: 12px; border-radius: 6px; }
+.bottone:disabled { opacity: .5; cursor: default; }
+
+.menu-contenitore { position: relative; }
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  background: var(--carta);
+  border: 1px solid var(--bordo-forte);
+  border-radius: 9px;
+  box-shadow: var(--ombra);
+  min-width: 262px;
+  padding: 5px;
+  z-index: 60;
+}
+.menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-size: 13.5px;
+  padding: 7px 10px;
+  border: 0;
+  background: none;
+  color: var(--testo);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.menu button:hover { background: var(--accento-chiaro); }
+
+/* ------------------------------------------------------ pannello ricerca */
+
+.pannello-ricerca {
+  background: var(--carta);
+  border: 1px solid var(--bordo);
+  border-radius: var(--raggio);
+  box-shadow: var(--ombra);
+  padding: 16px;
+  margin: 22px 0 18px;
+}
+
+.ricerca-riga { display: flex; gap: 10px; }
+.campo-ricerca { position: relative; flex: 1; }
+
+.campo-ricerca input {
+  width: 100%;
+  font: inherit;
+  font-size: 17px;
+  font-family: var(--serif);
+  padding: 10px 38px 10px 14px;
+  border: 1px solid var(--bordo-forte);
+  border-radius: 8px;
+  background: var(--carta-2);
+  color: var(--testo);
+}
+.campo-ricerca input:focus { outline: 2px solid var(--accento); outline-offset: -1px; border-color: var(--accento); }
+.campo-ricerca input::-webkit-search-cancel-button { display: none; }
+
+.pulisci {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  border: 0; background: none; color: var(--testo-debole);
+  font-size: 20px; cursor: pointer; line-height: 1; padding: 0 4px;
+}
+
+.opzioni {
+  display: flex; flex-wrap: wrap; gap: 8px 18px;
+  align-items: center; margin-top: 13px;
+  font-size: 13px; color: var(--testo-tenue);
+}
+
+.gruppo-opzione { display: inline-flex; border: 1px solid var(--bordo-forte); border-radius: 7px; overflow: hidden; }
+.segmento { position: relative; }
+.segmento input { position: absolute; opacity: 0; pointer-events: none; }
+.segmento span { display: block; padding: 5px 13px; cursor: pointer; font-size: 13px; color: var(--testo-tenue); }
+.segmento + .segmento span { border-left: 1px solid var(--bordo-forte); }
+.segmento input:checked + span { background: var(--accento); color: var(--accento-testo); font-weight: 550; }
+
+.opzione-inline { display: inline-flex; align-items: center; gap: 6px; }
+.opzione-inline select {
+  font: inherit; font-size: 13px; padding: 3px 6px;
+  border: 1px solid var(--bordo-forte); border-radius: 6px;
+  background: var(--carta-2); color: var(--testo);
+}
+.opzione-inline input[type=checkbox] { accent-color: var(--accento); }
+
+.avviso-modo { font-size: 12.5px; color: var(--allerta); margin-top: 9px; }
+.avviso-modo:empty { display: none; }
+
+.nota-modo { font-size: 12.5px; color: var(--testo-debole); line-height: 1.45; }
+.nota-modo code {
+  font-family: var(--mono); font-size: 11.5px;
+  background: var(--carta-2); border: 1px solid var(--bordo);
+  border-radius: 4px; padding: 0 4px; color: var(--testo-tenue);
+}
+
+/* la modalità di ricerca stabilisce quali regolazioni siano pertinenti */
+body:not(.modo-numero) .solo-numero { display: none; }
+body:not(.modo-data) .solo-data { display: none; }
+body.modo-numero .solo-testo,
+body.modo-data .solo-testo { display: none; }
+
+.contatore {
+  display: inline-block; margin-left: 6px; min-width: 17px; padding: 0 5px;
+  border-radius: 999px; background: var(--bordo-forte); color: var(--carta);
+  font-size: 11px; font-weight: 600; text-align: center; vertical-align: 1px;
+}
+.contatore.allarme { background: var(--rosso); color: #fff; }
+
+/* =================================================== presenze e allarmi */
+
+:root {
+  --rosso: #a5342a;
+  --rosso-sfondo: #fbeceb;
+  --arancione: #9a5c10;
+  --arancione-sfondo: #fdf3e4;
+  --verde: #2f5d3f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --rosso: #e8968a;
+    --rosso-sfondo: #33201d;
+    --arancione: #e0b473;
+    --arancione-sfondo: #312616;
+    --verde: #8fc4a2;
+  }
+}
+
+.avviso-presenze {
+  max-width: 1040px;
+  margin: 16px auto 0;
+  border-radius: 9px;
+  padding: 10px 14px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  border: 1px solid var(--rosso);
+  background: var(--rosso-sfondo);
+  color: var(--rosso);
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.avviso-presenze.solo-arancione { border-color: var(--arancione); background: var(--arancione-sfondo); color: var(--arancione); }
+.avviso-presenze .corpo { flex: 1; min-width: 240px; }
+.avviso-presenze .lampeggio.secondo { margin-top: 7px; }
+.avviso-presenze .sintesi { display: none; }
+.avviso-presenze strong { font-weight: 650; }
+.avviso-presenze .nomi { font-family: var(--serif); font-size: 14.5px; }
+.avviso-presenze .bottone { border-color: currentColor; color: inherit; background: transparent; }
+.avviso-presenze .bottone:hover { background: rgba(0, 0, 0, .06); border-color: currentColor; }
+
+/* La nota lampeggia con una pulsazione contenuta, sufficiente a richiamare
+   l'attenzione senza rendere faticosa la lettura del testo. */
+.lampeggio { animation: pulsazione 1.5s ease-in-out infinite; }
+@keyframes pulsazione {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .42; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lampeggio { animation: none; text-decoration: underline; }
+}
+
+.pallino {
+  display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  background: currentColor; margin-right: 5px; vertical-align: 1px;
+}
+
+.tag.rosso { background: var(--rosso); border-color: var(--rosso); color: #fff; font-weight: 600; }
+.tag.arancione { background: var(--arancione); border-color: var(--arancione); color: #fff; font-weight: 600; }
+.tag.chiuso { background: var(--carta-2); border-color: var(--bordo-forte); color: var(--testo-debole); }
+
+/* -------------------------------------------------- prospetto presenze */
+
+.griglia-presenze { font-size: 12.5px; }
+.griglia-presenze th.seduta {
+  writing-mode: vertical-rl; transform: rotate(180deg);
+  height: 96px; padding: 6px 3px; font-size: 10.5px; white-space: nowrap;
+  text-transform: none; letter-spacing: 0;
+}
+.griglia-presenze td.cella {
+  text-align: center; padding: 4px 2px; cursor: pointer; user-select: none;
+  font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+}
+.griglia-presenze td.cella:hover { outline: 2px solid var(--accento); outline-offset: -2px; }
+.griglia-presenze td.cella.presente { color: var(--verde); }
+.griglia-presenze td.cella.assente { background: var(--rosso-sfondo); color: var(--rosso); }
+.griglia-presenze td.cella.vuoto { color: var(--bordo-forte); }
+.griglia-presenze td.cella.corretta::after { content: '•'; font-size: 9px; vertical-align: super; opacity: .7; }
+.griglia-presenze td.nome { white-space: nowrap; font-size: 13px; }
+.griglia-presenze td.nome small { color: var(--testo-debole); display: block; font-size: 11px; }
+.griglia-presenze tr.riga-rosso td.nome { border-left: 3px solid var(--rosso); }
+.griglia-presenze tr.riga-arancione td.nome { border-left: 3px solid var(--arancione); }
+
+.scheda-allarme {
+  border: 1px solid var(--bordo); border-left: 4px solid var(--bordo-forte);
+  border-radius: var(--raggio); background: var(--carta);
+  padding: 13px 15px; margin-bottom: 10px;
+}
+.scheda-allarme.rosso { border-left-color: var(--rosso); }
+.scheda-allarme.arancione { border-left-color: var(--arancione); }
+.scheda-allarme.chiuso { border-left-color: var(--bordo-forte); opacity: .78; }
+.scheda-allarme .nome-componente { font-family: var(--serif); font-size: 16.5px; font-weight: 600; }
+.scheda-allarme .dettaglio { font-size: 13px; color: var(--testo-tenue); margin-top: 3px; }
+.scheda-allarme .azioni-punto { margin-top: 10px; }
+
+.modulo-decadenza {
+  margin-top: 10px; padding: 11px 13px; border: 1px dashed var(--bordo-forte);
+  border-radius: 8px; background: var(--carta-2);
+  display: flex; gap: 9px; flex-wrap: wrap; align-items: flex-end;
+}
+.modulo-decadenza label { font-size: 12px; color: var(--testo-tenue); display: block; }
+.modulo-decadenza input {
+  font: inherit; font-size: 13px; padding: 5px 9px; margin-top: 3px;
+  border: 1px solid var(--bordo-forte); border-radius: 6px;
+  background: var(--carta); color: var(--testo);
+}
+.modulo-decadenza input.stretto { width: 120px; }
+
+/* ------------------------------------ cessazione dal mandato */
+
+.modulo-cessazione {
+  margin-top: 10px; padding: 12px 14px;
+  border: 1px dashed var(--bordo-forte); border-radius: 8px; background: var(--carta-2);
+}
+.modulo-cessazione label { font-size: 12px; color: var(--testo-tenue); display: block; }
+.modulo-cessazione input[type=text],
+.modulo-cessazione input:not([type]) {
+  font: inherit; font-size: 13.5px; padding: 6px 10px; margin-top: 3px; width: 280px; max-width: 100%;
+  border: 1px solid var(--bordo-forte); border-radius: 6px; background: var(--carta); color: var(--testo);
+}
+.elenco-cessazione {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 3px 14px; margin: 12px 0;
+  max-height: 270px; overflow-y: auto;
+  border-top: 1px solid var(--bordo); border-bottom: 1px solid var(--bordo);
+  padding: 9px 0;
+}
+.voce-cessazione {
+  display: flex; align-items: baseline; gap: 7px;
+  font-size: 13.5px; color: var(--testo); cursor: pointer; padding: 2px 0;
+}
+.voce-cessazione:hover { color: var(--accento); }
+.voce-cessazione input { accent-color: var(--accento); }
+.voce-cessazione small { color: var(--testo-debole); font-size: 11px; }
+
+.riquadro-esclusi {
+  margin-top: 12px; padding: 10px 13px;
+  border: 1px solid var(--bordo); border-radius: 8px; background: var(--carta-2);
+  font-size: 13px; color: var(--testo-tenue);
+}
+.voce-esclusa {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: var(--carta); border: 1px solid var(--bordo-forte);
+  border-radius: 999px; padding: 2px 4px 2px 11px; margin: 3px 5px 0 0;
+  font-family: var(--serif); font-size: 14px; color: var(--testo);
+}
+.voce-esclusa .bottone { padding: 1px 8px; font-size: 11px; border-radius: 999px; }
+
+.griglia-presenze tr.riga-cessato td { opacity: .62; }
+.griglia-presenze tr.riga-cessato td.nome { border-left: 3px solid var(--bordo-forte); }
+
+/* --------------------------------------------------------------- schede */
+
+/* La barra delle schede sta in testata, agganciata in cima insieme ai
+   comandi: resta quindi a portata di mano in qualunque punto della pagina.
+   L'ultima riga della testata è la barra stessa, il cui bordo inferiore
+   coincide con quello della testata, così che la scheda attiva vi si
+   appoggi. */
+.schede {
+  display: flex; gap: 2px;
+  max-width: 1040px; margin: 10px auto 0;
+}
+.testata.compatta .schede { margin-top: 5px; }
+.scheda {
+  font: inherit; font-size: 13.5px; padding: 8px 15px;
+  border: 0; background: none; color: var(--testo-tenue);
+  cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.scheda:hover { color: var(--testo); }
+.scheda.attiva { color: var(--testo); border-bottom-color: var(--accento); font-weight: 600; }
+
+/* -------------------------------------------------------------- esiti */
+
+.riepilogo { font-size: 13px; color: var(--testo-tenue); margin-bottom: 14px; }
+.riepilogo strong { color: var(--testo); }
+
+.vuoto {
+  text-align: center; padding: 54px 20px; color: var(--testo-debole);
+  font-family: var(--serif); font-size: 16px;
+}
+.vuoto .grande { display: block; font-size: 19px; color: var(--testo-tenue); margin-bottom: 8px; }
+
+.gruppo-verbale { margin-bottom: 26px; }
+
+.intestazione-verbale {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  padding-bottom: 7px; margin-bottom: 10px;
+  border-bottom: 1px solid var(--bordo);
+}
+.intestazione-verbale .numero { font-family: var(--serif); font-size: 18px; font-weight: 600; }
+.intestazione-verbale .data { color: var(--testo-tenue); font-size: 13.5px; }
+.intestazione-verbale .nomefile { color: var(--testo-debole); font-size: 11.5px; font-family: var(--mono); margin-left: auto; overflow-wrap: anywhere; }
+
+.scheda-punto {
+  background: var(--carta);
+  border: 1px solid var(--bordo);
+  border-radius: var(--raggio);
+  padding: 13px 15px;
+  margin-bottom: 9px;
+}
+
+.punto-riga1 { display: flex; gap: 9px; align-items: baseline; flex-wrap: wrap; margin-bottom: 3px; }
+
+.tag {
+  font-size: 11px; font-family: var(--mono); letter-spacing: .02em;
+  padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--bordo-forte); background: var(--carta-2); color: var(--testo-tenue);
+  white-space: nowrap;
+}
+.tag.punto { background: var(--accento-chiaro); border-color: var(--accento); color: var(--accento); font-weight: 600; }
+.tag.delibera { background: var(--accento); border-color: var(--accento); color: var(--accento-testo); font-weight: 600; }
+.tag.esito { text-transform: lowercase; }
+.tag.occorrenze { border-style: dashed; }
+
+.punto-titolo { font-family: var(--serif); font-size: 15.5px; font-weight: 600; line-height: 1.35; }
+.punto-sottopunti { font-size: 12.5px; color: var(--testo-tenue); margin-top: 3px; }
+
+.frammenti { margin-top: 9px; border-top: 1px dashed var(--bordo); padding-top: 9px; }
+.frammento {
+  font-family: var(--serif); font-size: 14.5px; line-height: 1.6;
+  color: var(--testo-tenue); margin-bottom: 7px; padding-left: 11px;
+  border-left: 2px solid var(--bordo);
+}
+.frammento:last-child { margin-bottom: 0; }
+.frammento mark {
+  background: var(--evidenza); color: inherit;
+  box-shadow: inset 0 -1px 0 var(--evidenza-bordo);
+  border-radius: 2px; padding: 0 1px;
+}
+.altri-frammenti { font-size: 12.5px; color: var(--testo-debole); padding-left: 13px; }
+
+.azioni-punto { margin-top: 10px; display: flex; gap: 7px; flex-wrap: wrap; }
+
+.bottone.pericolo { border-color: var(--allerta); color: var(--allerta); }
+.bottone.pericolo:hover { background: var(--allerta-sfondo); border-color: var(--allerta); }
+
+/* ------------------------------------------- ricerca per numero */
+
+.scheda-numero {
+  background: var(--carta); border: 1px solid var(--bordo);
+  border-left: 3px solid var(--accento);
+  border-radius: var(--raggio); padding: 15px 17px; margin-bottom: 12px;
+}
+.scheda-numero .titolo-atto {
+  font-family: var(--serif); font-size: 18px; font-weight: 600; line-height: 1.3;
+}
+.scheda-numero .sottotitolo-atto {
+  font-size: 13px; color: var(--testo-tenue); margin-top: 2px; margin-bottom: 10px;
+}
+
+.odg-elenco { margin: 0; padding: 0; list-style: none; counter-reset: none; }
+.odg-elenco li {
+  display: flex; gap: 9px; align-items: baseline;
+  padding: 6px 0; border-top: 1px dashed var(--bordo);
+}
+.odg-elenco li:first-child { border-top: 0; }
+.odg-elenco .num-punto {
+  font-family: var(--mono); font-size: 12px; color: var(--accento);
+  font-weight: 600; min-width: 30px; text-align: right; flex-shrink: 0;
+}
+.odg-elenco .testo-punto { flex: 1; font-family: var(--serif); font-size: 14.5px; line-height: 1.45; }
+.odg-elenco .sotto { padding-left: 26px; }
+.odg-elenco .sotto .testo-punto { font-size: 13.5px; color: var(--testo-tenue); }
+
+.testo-delibera,
+.testo-integrale {
+  font-family: var(--serif); font-size: 15px; line-height: 1.62;
+  background: var(--carta-2); border: 1px solid var(--bordo);
+  border-radius: 8px; padding: 13px 16px; margin-top: 4px;
+}
+.testo-delibera p,
+.testo-integrale p { margin: 0 0 7px; }
+.testo-delibera p:last-child,
+.testo-integrale p:last-child { margin-bottom: 0; }
+.testo-delibera .formula,
+.testo-integrale .formula {
+  font-variant: small-caps; letter-spacing: .06em; font-weight: 600;
+  text-align: center; margin: 11px 0 9px; color: var(--accento);
+}
+.testo-delibera .premessa,
+.testo-integrale .premessa {
+  padding-left: 13px; text-indent: -13px; color: var(--testo-tenue); font-size: 14.5px;
+}
+
+/* trattazione integrale di un punto, aperta dagli esiti di ricerca.
+   Non si impone un'altezza massima: uno scorrimento interno a un altro
+   scorrimento renderebbe scomoda la lettura. */
+.testo-integrale { margin-top: 11px; }
+.testo-integrale mark {
+  background: var(--evidenza); color: inherit;
+  box-shadow: inset 0 -1px 0 var(--evidenza-bordo);
+  border-radius: 2px; padding: 0 1px;
+}
+.intestazione-integrale {
+  font-family: var(--sans); font-size: 11.5px; color: var(--testo-debole);
+  text-transform: uppercase; letter-spacing: .04em;
+  padding-bottom: 8px; margin-bottom: 10px; border-bottom: 1px solid var(--bordo);
+}
+.bottone.rilievo { border-color: var(--accento); color: var(--accento); font-weight: 550; }
+.bottone.rilievo:hover { background: var(--accento-chiaro); }
+
+/* -------------------------------------------------------------- tabelle */
+
+.tabella-contenitore { overflow-x: auto; border: 1px solid var(--bordo); border-radius: var(--raggio); background: var(--carta); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+thead th {
+  text-align: left; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--testo-debole); font-weight: 600;
+  padding: 9px 12px; border-bottom: 1px solid var(--bordo); background: var(--carta-2);
+  white-space: nowrap; position: sticky; top: 0;
+}
+tbody td { padding: 9px 12px; border-bottom: 1px solid var(--bordo); vertical-align: top; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover { background: var(--carta-2); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+td.mono { font-family: var(--mono); font-size: 12px; }
+.riga-espandi { cursor: pointer; }
+.dettaglio-verbale { background: var(--carta-2); }
+.dettaglio-verbale ol { margin: 4px 0 4px 18px; padding: 0; }
+.dettaglio-verbale li { margin-bottom: 3px; }
+
+.filtro-tabella {
+  display: flex; gap: 10px; align-items: center; margin-bottom: 12px; font-size: 13px; color: var(--testo-tenue);
+}
+.filtro-tabella input {
+  font: inherit; font-size: 13.5px; padding: 5px 10px; flex: 1; max-width: 340px;
+  border: 1px solid var(--bordo-forte); border-radius: 7px; background: var(--carta); color: var(--testo);
+}
+
+/* --------------------------------------------------------- diagnostica */
+
+.riquadro {
+  background: var(--carta); border: 1px solid var(--bordo);
+  border-radius: var(--raggio); padding: 14px 16px; margin-bottom: 12px;
+}
+.riquadro.attenzione { border-color: var(--allerta); background: var(--allerta-sfondo); }
+.riquadro h3 { margin: 0 0 7px; font-family: var(--serif); font-size: 15.5px; font-weight: 600; }
+.riquadro p { margin: 0 0 6px; font-size: 13.5px; color: var(--testo-tenue); }
+.riquadro ul { margin: 4px 0 0 18px; padding: 0; font-size: 13.5px; color: var(--testo-tenue); }
+
+/* ----------------------------------------------------- velo e progresso */
+
+.velo {
+  position: fixed; inset: 0; background: rgba(20, 22, 18, .45);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+}
+.dialogo {
+  background: var(--carta); border-radius: 12px; padding: 22px 26px;
+  min-width: 340px; max-width: 90vw; box-shadow: 0 10px 40px rgba(0, 0, 0, .3);
+}
+.dialogo-titolo { font-family: var(--serif); font-size: 17px; font-weight: 600; margin-bottom: 12px; }
+.dialogo-testo { font-size: 12.5px; color: var(--testo-tenue); margin-top: 10px; font-family: var(--mono); overflow-wrap: anywhere; }
+.barra { height: 6px; background: var(--bordo); border-radius: 999px; overflow: hidden; }
+.barra-riempimento { height: 100%; width: 0; background: var(--accento); transition: width .18s; }
+
+.zona-trascinamento {
+  position: fixed; inset: 0; z-index: 110;
+  background: rgba(47, 93, 63, .92); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--serif); font-size: 21px; text-align: center;
+  border: 4px dashed rgba(255, 255, 255, .6);
+}
+.zona-trascinamento small { font-family: var(--sans); font-size: 13px; opacity: .8; }
+
+/* ---------------------------------------------------------- responsivo */
+
+@media (max-width: 680px) {
+  main { padding: 0 14px 60px; }
+  .ricerca-riga { flex-direction: column; }
+  .intestazione-verbale .nomefile { margin-left: 0; width: 100%; }
+  .azioni-testata { width: auto; }
+  /* sullo schermo stretto il titolo per esteso andrebbe a capo e alzerebbe
+     la testata di una riga: se ne mostra la forma breve */
+  .titolo-esteso { display: none; }
+  .titolo-breve { display: inline; }
+  /* Sullo schermo del telefono la testata ridotta rinuncia anche al titolo:
+     restano i comandi, l'eventuale avviso e la barra delle schede, che sono
+     le sole parti utili mentre si scorre. */
+  .testata.compatta .marchio { display: none; }
+  .testata.compatta .azioni-testata { width: auto; }
+}
+
+/* ===================================================================
+   RACCOLTA DA CONDIVIDERE, ANTEPRIMA DI STAMPA E FOGLIO STAMPATO
+   =================================================================== */
+
+/* Messaggio effimero di conferma (aggiunta alla raccolta e simili). */
+.messaggio {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 130; max-width: 76vw; text-align: center;
+  background: var(--accento); color: var(--accento-testo);
+  font-size: 13.5px; padding: 9px 18px; border-radius: 999px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, .25);
+  animation: comparsa-messaggio .18s ease-out;
+}
+@keyframes comparsa-messaggio {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
+
+/* ------------------------------------------- scheda «Da condividere» */
+
+.voce-raccolta {
+  background: var(--carta); border: 1px solid var(--bordo); border-radius: var(--raggio);
+  padding: 11px 14px; margin-bottom: 9px; box-shadow: var(--ombra);
+}
+.voce-raccolta .titolo-voce { font-family: var(--serif); font-size: 15px; font-weight: 600; margin: 2px 0 3px; }
+.voce-raccolta .sommario-voce { font-size: 12.5px; color: var(--testo-tenue); margin-bottom: 7px; }
+.voce-raccolta .opzioni-voce {
+  display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: center;
+  font-size: 12.5px; color: var(--testo-tenue); margin: 6px 0 2px;
+}
+.voce-raccolta .opzioni-voce label { display: inline-flex; align-items: center; gap: 5px; }
+.voce-raccolta textarea {
+  width: 100%; min-height: 78px; font-family: var(--serif); font-size: 14px;
+  padding: 8px 10px; border: 1px solid var(--bordo-forte); border-radius: 8px;
+  background: var(--carta-2); color: var(--testo); resize: vertical;
+}
+.riga-ordine { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+.riga-ordine .indice-voce { font-family: var(--mono); font-size: 11.5px; color: var(--testo-debole); min-width: 20px; }
+.intestazione-raccolta { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-top: 4px; }
+.intestazione-raccolta label { font-size: 12.5px; color: var(--testo-tenue); display: block; }
+.intestazione-raccolta input[type=text] {
+  width: 100%; padding: 7px 10px; font-size: 13.5px; margin-top: 3px;
+  border: 1px solid var(--bordo-forte); border-radius: 8px;
+  background: var(--carta-2); color: var(--testo);
+}
+.intestazione-raccolta .campo-largo { flex: 1 1 340px; }
+.intestazione-raccolta .campo-stretto { flex: 0 1 220px; }
+
+/* ------------------------------------------------ anteprima di stampa */
+
+.velo-stampa { position: fixed; inset: 0; z-index: 120; background: #6f7069; display: flex; flex-direction: column; }
+.barra-stampa {
+  display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap;
+  padding: 10px 18px; background: var(--carta); border-bottom: 1px solid var(--bordo-forte);
+}
+.barra-stampa .barra-titolo { font-family: var(--serif); font-size: 16px; font-weight: 600; }
+.barra-stampa .barra-azioni { margin-left: auto; display: flex; gap: 8px; }
+.opzione-stampa { font-size: 13px; color: var(--testo-tenue); display: inline-flex; align-items: center; gap: 6px; }
+.opzione-stampa select {
+  font-size: 13px; padding: 4px 7px; border: 1px solid var(--bordo-forte);
+  border-radius: 7px; background: var(--carta-2); color: var(--testo);
+}
+.avviso-stampa { font-size: 12.5px; color: var(--allerta); max-width: 430px; }
+.area-anteprima { flex: 1; overflow: auto; padding: 22px; display: flex; justify-content: center; align-items: flex-start; }
+.foglio { background: #ffffff; box-shadow: 0 6px 28px rgba(0, 0, 0, .35); overflow: hidden; flex: 0 0 auto; }
+.foglio-interno { transform-origin: top left; display: flow-root; }
+
+/* ---------------------------------------------- il documento stampato */
+
+/* Il foglio conserva i colori della carta anche quando il programma viene
+   visualizzato in tema scuro: cio' che si stampa non deve dipendere dal
+   modo in cui lo schermo e' regolato. */
+.doc-stampa {
+  background: #ffffff; color: #16170f;
+  font-family: "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  font-size: 10.5pt; line-height: 1.36;
+}
+.doc-stampa .intestazione-foglio { border-bottom: 1.6pt solid #1f4e79; padding-bottom: 6pt; margin-bottom: 12pt; }
+.doc-stampa .ente {
+  font-family: Arial, Helvetica, sans-serif; font-size: 8.5pt;
+  letter-spacing: .06em; text-transform: uppercase; color: #4a4d44;
+}
+.doc-stampa .organo { font-size: 12pt; font-weight: 600; color: #1f4e79; margin-top: 1pt; }
+.doc-stampa h1 { font-size: 16pt; font-weight: 600; margin: 7pt 0 2pt; }
+.doc-stampa .sottotitolo-foglio { font-size: 9.5pt; color: #4a4d44; }
+.doc-stampa .nota-intestazione {
+  font-size: 10pt; margin: 8pt 0 0; padding: 6pt 9pt;
+  background: #f1f4f7; border-left: 2.5pt solid #1f4e79;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.doc-stampa .blocco { margin-bottom: 13pt; }
+.doc-stampa .blocco + .blocco { border-top: .6pt solid #cfd0c9; padding-top: 10pt; }
+.doc-stampa h2 { font-size: 12.5pt; font-weight: 600; margin: 0 0 1pt; break-after: avoid; }
+.doc-stampa .riferimento {
+  font-family: Arial, Helvetica, sans-serif; font-size: 8.5pt; color: #4a4d44;
+  margin-bottom: 5pt; break-after: avoid;
+}
+.doc-stampa .oggetto { font-size: 11pt; font-style: italic; margin: 0 0 6pt; }
+.doc-stampa p { margin: 0 0 4.5pt; text-align: justify; }
+.doc-stampa p.formula { font-variant: small-caps; font-weight: 600; text-align: center; margin: 6pt 0; letter-spacing: .03em; }
+.doc-stampa p.premessa { margin-left: 10pt; }
+.doc-stampa .passaggio { margin: 0 0 5pt; padding-left: 8pt; border-left: 2pt solid #d8d9d2; }
+.doc-stampa mark {
+  background: #fff0a0; padding: 0 1pt;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.doc-stampa .sotto-titolo-blocco {
+  font-family: Arial, Helvetica, sans-serif; font-size: 9pt; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .05em; color: #4a4d44;
+  margin: 9pt 0 3pt; break-after: avoid;
+}
+.doc-stampa ul.odg-stampa { list-style: none; margin: 0; padding: 0; }
+.doc-stampa ul.odg-stampa li { margin-bottom: 2.5pt; padding-left: 17pt; text-indent: -17pt; }
+.doc-stampa ul.odg-stampa li.sotto { padding-left: 32pt; text-indent: -15pt; font-size: 10pt; }
+.doc-stampa .segno { font-family: Arial, Helvetica, sans-serif; font-size: 8pt; color: #1f4e79; white-space: nowrap; }
+
+.doc-stampa table.prospetto {
+  border-collapse: collapse; width: 100%;
+  font-family: Arial, Helvetica, sans-serif; font-size: 8pt;
+}
+.doc-stampa table.prospetto th,
+.doc-stampa table.prospetto td { border: .5pt solid #b9bab3; padding: 1.6pt 3pt; text-align: center; vertical-align: middle; }
+.doc-stampa table.prospetto thead th {
+  background: #e6ecf0; font-weight: 700; line-height: 1.15;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.doc-stampa table.prospetto th.seduta small { display: block; font-weight: 400; font-size: .82em; color: #4a4d44; }
+.doc-stampa table.prospetto td.nome,
+.doc-stampa table.prospetto th.nome { text-align: left; white-space: nowrap; font-size: 1.06em; }
+.doc-stampa table.prospetto td.nome small {
+  display: block; font-size: .82em; color: #5e6158; white-space: normal;
+}
+.doc-stampa table.prospetto td.p { color: #22502f; font-weight: 700; }
+.doc-stampa table.prospetto td.a {
+  color: #8a2318; font-weight: 700; background: #fbeeeb;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.doc-stampa table.prospetto td.v { color: #a9aca2; }
+.doc-stampa table.prospetto tr.totali td {
+  background: #f4f4f1; font-weight: 700;
+  -webkit-print-color-adjust: exact; print-color-adjust: exact;
+}
+.doc-stampa table.prospetto td.stato-cella { white-space: nowrap; font-size: .92em; }
+
+/* Riquadro che contiene la tabella: quando questa viene rimpicciolita per
+   rientrare nella larghezza della pagina, ne accoglie l'altezza ridotta. */
+.doc-stampa .riquadro-tabella > table.prospetto { transform-origin: top left; }
+.doc-stampa .legenda {
+  font-family: Arial, Helvetica, sans-serif; font-size: 7.8pt; color: #4a4d44;
+  margin-top: 5pt; line-height: 1.3;
+}
+.doc-stampa .segnalazioni { font-family: Arial, Helvetica, sans-serif; font-size: 8.4pt; margin-top: 7pt; }
+.doc-stampa .segnalazioni ul { margin: 2pt 0 0 14pt; padding: 0; }
+.doc-stampa .segnalazioni li { margin-bottom: 1.5pt; }
+.doc-stampa .piede-foglio {
+  border-top: .6pt solid #cfd0c9; margin-top: 12pt; padding-top: 5pt;
+  font-family: Arial, Helvetica, sans-serif; font-size: 7.8pt; color: #6a6d64;
+  display: flex; justify-content: space-between; gap: 14pt;
+}
+
+/* Le caselle corrette a mano portano un puntino anche sulla carta. */
+.doc-stampa table.prospetto td.corretta::after {
+  content: '\2022'; font-size: 6pt; vertical-align: super; margin-left: .5pt;
+}
+
+/* ---------------------------------------------------- resa di stampa */
+
+/* Durante l'anteprima il corpo della pagina porta la classe
+   «stampa-attiva»: si stampa il solo foglio, non l'applicazione. */
+@media print {
+  body.stampa-attiva { background: #fff; }
+  body.stampa-attiva > *:not(#velo-stampa) { display: none !important; }
+  body.stampa-attiva #velo-stampa { position: static; display: block; background: none; inset: auto; }
+  body.stampa-attiva .barra-stampa { display: none !important; }
+  body.stampa-attiva .area-anteprima { display: block; overflow: visible; padding: 0; }
+  body.stampa-attiva .foglio { box-shadow: none; overflow: visible; }
+  /* Il foglio ridotto conserva il ritaglio: l'altezza del riquadro, non
+     quella del contenuto prima della riduzione, determina la pagina. */
+  body.stampa-attiva .foglio.ritagliato { overflow: hidden; }
+}
+
+/* ---------------------------------------- collegamento al repository GitHub */
+.gh-velo {
+  position: fixed; inset: 0; z-index: 200; background: rgba(20, 22, 18, .55);
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+}
+.gh-dialogo {
+  background: var(--carta); color: var(--testo); border-radius: 12px; padding: 22px 24px;
+  width: 100%; max-width: 440px; box-shadow: 0 10px 40px rgba(0, 0, 0, .3);
+}
+.gh-dialogo h2 { font-family: var(--serif); font-size: 19px; margin: 0 0 8px; }
+.gh-dialogo p { font-size: 13.5px; color: var(--testo-tenue); line-height: 1.5; margin: 0 0 14px; }
+.gh-dialogo label { display: block; font-size: 13px; color: var(--testo-tenue); margin-bottom: 12px; }
+.gh-dialogo input {
+  display: block; width: 100%; margin-top: 4px; padding: 9px 10px; font-size: 16px;
+  border: 1px solid var(--bordo-forte); border-radius: 8px; background: var(--carta-2); color: var(--testo);
+  font-family: var(--mono);
+}
+.gh-dialogo .gh-errore { color: var(--allerta); background: var(--allerta-sfondo); padding: 8px 10px; border-radius: 8px; }
+.gh-azioni { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+.gh-avviso {
+  background: var(--allerta-sfondo); color: var(--allerta); padding: 10px 16px; font-size: 13.5px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+}
+
+/* ------------------------------------------------ uso da telefono */
+@media (max-width: 680px) {
+  /* overflow-x: clip e non hidden. Con "hidden" il documento diventa un
+     contenitore di scorrimento e la testata, pur dichiarata sticky, non resta
+     agganciata in cima: scorre via insieme alla pagina e il menu delle azioni
+     finisce fuori dallo schermo. "clip" impedisce lo scorrimento orizzontale
+     senza produrre quell'effetto. */
+  html, body { overflow-x: clip; }
+  .schede { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  .schede::-webkit-scrollbar { display: none; }
+  .scheda { flex: 0 0 auto; white-space: nowrap; padding: 8px 11px; }
+  .tabella-contenitore { overflow-x: auto; max-width: 100%; }
+  .stato-archivio .percorso { overflow-wrap: anywhere; }
+  .azioni-punto { flex-wrap: wrap; }
+  .menu {
+    left: 0; right: auto;
+    min-width: 0;
+    width: calc(100vw - 32px);
+    max-width: 320px;
+  }
+}
+
+/* ------------------------------ anteprima e prospetto sullo schermo del telefono */
+@media screen {
+  .foglio { zoom: var(--zoom-anteprima, 1); }
+}
+@media (max-width: 680px) {
+  .area-anteprima { justify-content: safe center; padding: 10px; }
+  .barra-stampa { padding: 8px 12px; }
+  .barra-stampa .barra-azioni { margin-left: 0; width: 100%; }
+  .barra-stampa .barra-azioni .bottone { flex: 1; }
+
+  .griglia-presenze { font-size: 11.5px; }
+  .griglia-presenze td.nome,
+  .griglia-presenze thead th:first-child {
+    position: sticky; left: 0; z-index: 1; background: var(--carta);
+    white-space: normal; min-width: 118px; max-width: 132px; font-size: 12px; line-height: 1.25;
+    box-shadow: 1px 0 0 var(--bordo);
+  }
+  .griglia-presenze thead th:first-child { z-index: 2; background: var(--carta-2); }
+  .griglia-presenze td.nome small { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .griglia-presenze td { vertical-align: middle; }
+  .griglia-presenze th.seduta { height: 84px; font-size: 10px; padding: 4px 2px; }
+  .griglia-presenze td.cella { padding: 6px 3px; min-width: 26px; }
+}
