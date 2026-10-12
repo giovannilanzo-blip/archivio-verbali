@@ -17,8 +17,7 @@
 <header class="testata">
   <div class="testata-riga">
     <div class="marchio">
-      <div class="marchio-titolo">Archivio dei verbali del Consiglio d'Istituto</div>
-      <div class="marchio-sottotitolo">Liceo Scientifico Statale &ldquo;Nicolò Palmeri&rdquo; &middot; Termini Imerese</div>
+      <div class="marchio-titolo"><span class="titolo-esteso">Archivio dei verbali del Consiglio d'Istituto</span><span class="titolo-breve">Archivio dei verbali</span></div>
     </div>
     <div class="azioni-testata">
       <div class="menu-contenitore">
@@ -34,9 +33,6 @@
       </div>
     </div>
   </div>
-  <div id="stato-archivio" class="stato-archivio">Avvio in corso…</div>
-  <div id="avviso-presenze" class="avviso-presenze" hidden></div>
-
   <nav class="schede" role="tablist">
     <button class="scheda attiva" data-scheda="risultati" role="tab">Risultati</button>
     <button class="scheda" data-scheda="verbali" role="tab">Verbali</button>
@@ -49,6 +45,9 @@
 </header>
 
 <main>
+
+  <div id="avviso-presenze" class="avviso-presenze" hidden></div>
+  <div id="stato-archivio" class="stato-archivio">Avvio in corso…</div>
 
   <section class="pannello-ricerca">
     <div class="ricerca-riga">
