@@ -1960,11 +1960,16 @@
     var car = arr.reduce(function (a, d) { return a + (d.caratteri || 0); }, 0);
     var par = arr.reduce(function (a, d) { return a + (d.paragrafi || []).length; }, 0);
 
+    var delib = arr.reduce(function (a, d) { return a + ((d.delibere || []).length); }, 0);
     h += '<div class="riquadro"><h3>Stato dell\'indice</h3>' +
-      '<p>' + ok + ' verbali su ' + tot + ' risultano indicizzati, per complessivi ' +
+      '<p>' + ok + ' verbali su ' + tot + ' risultano indicizzati, con ' + delib +
+      (delib === 1 ? ' delibera censita' : ' delibere censite') + ', per complessivi ' +
       par.toLocaleString('it-IT') + ' paragrafi e ' + car.toLocaleString('it-IT') + ' caratteri ricercabili.' +
       (stato.indice && stato.indice.generato ? ' Ultimo aggiornamento: ' + new Date(stato.indice.generato).toLocaleString('it-IT') + '.' : '') +
-      '</p></div>';
+      '</p>' +
+      /* il recapito dell'archivio, tolto dalla testata, si legge qui */
+      '<p class="percorso">' + esc((stato.config && stato.config.archivePath) || '') + '</p>' +
+      '</div>';
 
     function blocco(titolo, testo, lista, grave) {
       if (!lista.length) return '';
@@ -2076,13 +2081,24 @@
     docs().forEach(function (d) { nd += (d.delibere || []).length; });
     var problemi = n - ok;
 
+    /* La riga di stato compare soltanto quando c'è qualcosa da sapere:
+       archivio irraggiungibile o verbali da verificare. Quando tutto è in
+       ordine resta nascosta, e il conteggio dei verbali e delle delibere si
+       legge nella scheda Diagnostica. */
+    var riga = el('stato-archivio');
     var h = '';
     h += '<span class="pill' + (c.esiste ? '' : ' err') + '">' + (c.esiste ? 'archivio collegato' : 'archivio non trovato') + '</span>';
     h += '<span class="pill">' + n + ' verbali</span>';
     h += '<span class="pill">' + nd + ' delibere</span>';
     if (problemi > 0) h += '<span class="pill err">' + problemi + ' da verificare</span>';
     h += '<span class="percorso">' + esc(c.archivePath || '') + '</span>';
-    el('stato-archivio').innerHTML = h;
+    /* Il contenuto viene composto sempre, così che resti leggibile da chi
+       interroga la pagina, ma la riga si mostra soltanto quando c'è qualcosa
+       da sapere. */
+    riga.innerHTML = h;
+    riga.hidden = c.esiste && problemi === 0;
+    stato.contaVerbali = n;
+    stato.contaDelibere = nd;
   }
 
   function ridisegnaTutto() {
@@ -3304,6 +3320,7 @@
     chiediJson('/api/config').then(function (c) {
       stato.config = c || {};
       if (!stato.config.esiste) {
+        el('stato-archivio').hidden = false;
         el('stato-archivio').innerHTML = '<span class="pill err">cartella non trovata</span>' +
           '<span class="percorso">' + esc(stato.config.archivePath || '') + '</span>';
         el('vista-risultati').innerHTML = '<div class="riquadro attenzione"><h3>La cartella dei verbali non è stata trovata</h3>' +
@@ -3335,6 +3352,7 @@
         .then(ridisegnaTutto);
     }).catch(function (e) {
       velo(false);
+      el('stato-archivio').hidden = false;
       el('stato-archivio').innerHTML = '<span class="pill err">errore di avvio</span><span class="percorso">' + esc(e.message) + '</span>';
       console.error(e);
     });
