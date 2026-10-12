@@ -70,11 +70,26 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
 .testata {
   background: var(--carta);
   border-bottom: 1px solid var(--bordo);
-  padding: 16px 20px 12px;
+  padding: 16px 20px 0;
   position: sticky;
   top: 0;
   z-index: 40;
 }
+
+/* Testata ridotta durante lo scorrimento. Restando agganciata in cima, la
+   testata sottrarrebbe altrimenti un quarto dello schermo del telefono: una
+   volta che la pagina si è mossa restano il titolo, i comandi e, se presenti,
+   le righe principali dell'avviso sulle assenze. */
+.testata.compatta { padding: 8px 20px 0; box-shadow: 0 2px 10px rgba(0, 0, 0, .07); }
+.testata.compatta .marchio-titolo { font-size: 16px; }
+.testata.compatta .marchio-sottotitolo,
+.testata.compatta .stato-archivio,
+.testata.compatta .avviso-presenze .nomi { display: none; }
+.testata.compatta .avviso-presenze { margin: 7px auto 0; padding: 6px 11px; font-size: 12.5px; flex-wrap: nowrap; align-items: center; }
+.testata.compatta .avviso-presenze .corpo { display: none; }
+.testata.compatta .avviso-presenze .sintesi { display: block; flex: 1; min-width: 0; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.testata.compatta .avviso-presenze .bottone { flex: 0 0 auto; }
+.testata.compatta .avviso-presenze .lampeggio.secondo { margin-top: 0; }
 
 .testata-riga {
   max-width: 1040px;
@@ -90,6 +105,9 @@ main { max-width: 1080px; margin: 0 auto; padding: 0 20px 80px; }
 .marchio-sottotitolo { color: var(--testo-tenue); font-size: 12.5px; margin-top: 1px; }
 
 .azioni-testata { display: flex; gap: 8px; align-items: center; }
+
+/* Comandi dell'archivio, in testa alla sola scheda Verbali. */
+.azioni-verbali { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; }
 
 .stato-archivio {
   max-width: 1040px;
@@ -275,6 +293,8 @@ body.modo-data .solo-testo { display: none; }
 }
 .avviso-presenze.solo-arancione { border-color: var(--arancione); background: var(--arancione-sfondo); color: var(--arancione); }
 .avviso-presenze .corpo { flex: 1; min-width: 240px; }
+.avviso-presenze .lampeggio.secondo { margin-top: 7px; }
+.avviso-presenze .sintesi { display: none; }
 .avviso-presenze strong { font-weight: 650; }
 .avviso-presenze .nomi { font-family: var(--serif); font-size: 14.5px; }
 .avviso-presenze .bottone { border-color: currentColor; color: inherit; background: transparent; }
@@ -392,7 +412,16 @@ body.modo-data .solo-testo { display: none; }
 
 /* --------------------------------------------------------------- schede */
 
-.schede { display: flex; gap: 2px; border-bottom: 1px solid var(--bordo); margin-bottom: 18px; }
+/* La barra delle schede sta in testata, agganciata in cima insieme ai
+   comandi: resta quindi a portata di mano in qualunque punto della pagina.
+   L'ultima riga della testata è la barra stessa, il cui bordo inferiore
+   coincide con quello della testata, così che la scheda attiva vi si
+   appoggi. */
+.schede {
+  display: flex; gap: 2px;
+  max-width: 1040px; margin: 10px auto 0;
+}
+.testata.compatta .schede { margin-top: 5px; }
 .scheda {
   font: inherit; font-size: 13.5px; padding: 8px 15px;
   border: 0; background: none; color: var(--testo-tenue);
@@ -600,7 +629,12 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   main { padding: 0 14px 60px; }
   .ricerca-riga { flex-direction: column; }
   .intestazione-verbale .nomefile { margin-left: 0; width: 100%; }
-  .azioni-testata { width: 100%; }
+  .azioni-testata { width: auto; }
+  /* Sullo schermo del telefono la testata ridotta rinuncia anche al titolo:
+     restano i comandi, l'eventuale avviso e la barra delle schede, che sono
+     le sole parti utili mentre si scorre. */
+  .testata.compatta .marchio { display: none; }
+  .testata.compatta .azioni-testata { width: auto; }
 }
 
 /* ===================================================================
@@ -810,7 +844,12 @@ td.mono { font-family: var(--mono); font-size: 12px; }
 
 /* ------------------------------------------------ uso da telefono */
 @media (max-width: 680px) {
-  html, body { overflow-x: hidden; }
+  /* overflow-x: clip e non hidden. Con "hidden" il documento diventa un
+     contenitore di scorrimento e la testata, pur dichiarata sticky, non resta
+     agganciata in cima: scorre via insieme alla pagina e il menu delle azioni
+     finisce fuori dallo schermo. "clip" impedisce lo scorrimento orizzontale
+     senza produrre quell'effetto. */
+  html, body { overflow-x: clip; }
   .schede { overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
   .schede::-webkit-scrollbar { display: none; }
   .scheda { flex: 0 0 auto; white-space: nowrap; padding: 8px 11px; }
