@@ -854,11 +854,20 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   .tabella-contenitore { overflow-x: auto; max-width: 100%; }
   .stato-archivio .percorso { overflow-wrap: anywhere; }
   .azioni-punto { flex-wrap: wrap; }
+  /* La tendina delle azioni non va ancorata al pulsante: sullo schermo
+     stretto i comandi cambiano posizione a seconda di quanto occupa il titolo,
+     e la tendina finiva ora fuori dal bordo sinistro ora fuori dal destro.
+     Rendendo statico il contenitore, il riferimento diventa la testata, che è
+     sticky e quindi stabilisce il blocco di contenimento: la tendina si apre
+     sotto la testata, larga quanto lo schermo meno i margini. */
+  .menu-contenitore { position: static; }
   .menu {
-    left: 0; right: auto;
+    left: 12px;
+    right: 12px;
+    top: calc(100% + 4px);
+    width: auto;
     min-width: 0;
-    width: calc(100vw - 32px);
-    max-width: 320px;
+    max-width: none;
   }
 }
 
