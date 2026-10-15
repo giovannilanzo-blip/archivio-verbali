@@ -894,3 +894,53 @@ td.mono { font-family: var(--mono); font-size: 12px; }
   .griglia-presenze th.seduta { height: 84px; font-size: 10px; padding: 4px 2px; }
   .griglia-presenze td.cella { padding: 6px 3px; min-width: 26px; }
 }
+
+/* ------------------------- schede Verbali e Delibere sullo schermo del telefono
+   Sotto i 680 px la tabella compressa nella larghezza dello schermo riduceva le
+   colonne di testo (delibere adottate, nome del file, oggetto) a una parola per
+   riga: le righe diventavano altissime e la parte visibile restava vuota. Ogni
+   riga viene quindi composta come un riquadro, con i dati brevi sulla prima
+   linea e i testi lunghi sotto, a tutta larghezza. Le etichette prendono il
+   posto dell'intestazione, che viene nascosta. Il desktop non cambia. */
+@media (max-width: 680px) {
+  .tabella-schede thead { display: none; }
+  .tabella-schede, .tabella-schede tbody { display: block; width: 100%; }
+  .tabella-schede tbody tr {
+    display: grid; column-gap: 12px; row-gap: 4px; align-items: baseline;
+    padding: 10px 12px; border-bottom: 1px solid var(--bordo);
+  }
+  .tabella-schede tbody tr:last-child { border-bottom: 0; }
+  .tabella-schede tbody td { display: block; padding: 0; border: 0; text-align: left; }
+  .tabella-schede td[data-etichetta]::before {
+    content: attr(data-etichetta) " "; color: var(--testo-debole);
+    font-family: var(--sans); font-size: 11.5px; font-weight: 400;
+  }
+
+  /* Verbali: numero, data, punti e delibere sulla prima linea; sotto l'elenco
+     delle delibere adottate e il nome del file. */
+  .tabella-verbali tbody tr.riga-espandi {
+    grid-template-columns: auto 1fr auto auto;
+    grid-template-areas: "numero data punti delibere" "elenco elenco elenco elenco" "file file file file";
+  }
+  .tabella-verbali .c-numero { grid-area: numero; font-weight: 600; }
+  .tabella-verbali .c-data { grid-area: data; }
+  .tabella-verbali .c-punti { grid-area: punti; }
+  .tabella-verbali .c-delibere { grid-area: delibere; }
+  .tabella-verbali .c-elenco { grid-area: elenco; overflow-wrap: anywhere; line-height: 1.45; }
+  .tabella-verbali .c-elenco::before { display: block; margin-bottom: 1px; }
+  .tabella-verbali .c-file { grid-area: file; overflow-wrap: anywhere; font-size: 11px; color: var(--testo-debole); }
+  .tabella-verbali tbody tr.dettaglio-verbale { display: block; padding: 10px 12px; }
+  .tabella-verbali tbody tr.dettaglio-verbale[hidden] { display: none; }
+
+  /* Delibere: numero, verbale, seduta e punto sulla prima linea; sotto
+     l'oggetto con i comandi. */
+  .tabella-delibere tbody tr {
+    grid-template-columns: auto auto 1fr auto;
+    grid-template-areas: "numero verbale data punto" "oggetto oggetto oggetto oggetto";
+  }
+  .tabella-delibere .c-numero { grid-area: numero; }
+  .tabella-delibere .c-verbale { grid-area: verbale; }
+  .tabella-delibere .c-data { grid-area: data; }
+  .tabella-delibere .c-punto { grid-area: punto; }
+  .tabella-delibere .c-oggetto { grid-area: oggetto; line-height: 1.45; }
+}
