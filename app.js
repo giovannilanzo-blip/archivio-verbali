@@ -1084,9 +1084,7 @@
       docs().forEach(function (d) { nd += (d.delibere || []).length; });
       v.innerHTML = '<div class="vuoto"><span class="grande">Archivio pronto alla consultazione</span>' +
         esc(n) + ' verbali indicizzati, ' + esc(nd) + ' delibere censite.<br>' +
-        'La ricerca si apre dal menu \u22ef in alto a destra, voce «Cerca nei verbali».' +
-        '<div class="azioni-punto" style="justify-content:center;margin-top:14px">' +
-        '<button class="bottone primario" data-apri-ricerca="1">Cerca nei verbali</button></div></div>';
+        'Si scrive nel campo in alto ciò che si vuole cercare e si sceglie il tipo di ricerca.</div>';
       return;
     }
 
@@ -1168,15 +1166,156 @@
 
   /* ------------------------------------------------------- vista verbali */
 
+  /* ------------------------------------------- filtri di Verbali e Delibere
+
+     Ciascuna delle due schede ha in testa una riga di filtri: il numero
+     (del verbale o della delibera) e la data. La riga viene costruita una sola
+     volta e non viene rigenerata a ogni carattere digitato, così che il campo
+     non perda il cursore; a ogni modifica si ridisegna soltanto l'elenco.
+
+     La data si scrive in una delle forme già accettate dalla ricerca per data
+     (23/04/2026, 23 aprile 2026, aprile 2026, 2026, a.s. 2025/26). Se nel
+     periodo indicato non si è tenuta alcuna seduta, il filtro conduce alla
+     seduta più vicina, anteriore o posteriore; se due sedute sono alla stessa
+     distanza, vengono mostrate entrambe. */
+
+  function giorniFra(isoA, isoB) {
+    var a = isoA.split('-'), b = isoB.split('-');
+    return Math.round((Date.UTC(+b[0], +b[1] - 1, +b[2]) - Date.UTC(+a[0], +a[1] - 1, +a[2])) / 86400000);
+  }
+
+  /* Restituisce null se il campo è vuoto; altrimenti { valida, sedute, nota }:
+     sedute è l'insieme delle date ISO ammesse, nota il testo da mostrare sotto
+     i filtri. */
+  function filtroSedute(testo) {
+    var q = (testo || '').trim();
+    if (!q) return null;
+    var an = analizzaData(q);
+    if (!an) return { valida: false, sedute: null, nota: 'Data non riconosciuta: il filtro per data non viene applicato.' };
+    var tutte = {};
+    docs().forEach(function (d) { if (!d.errore && d.dataISO) tutte[d.dataISO] = true; });
+    var date = Object.keys(tutte).sort();
+    if (!date.length) return { valida: true, sedute: {}, nota: 'Nessuna seduta datata nell\'archivio.' };
+
+    var dentro = date.filter(function (iso) {
+      return an.intervalli.some(function (iv) { return iso >= iv.da && iso <= iv.a; });
+    });
+    var insieme = {};
+    if (dentro.length) {
+      dentro.forEach(function (iso) { insieme[iso] = true; });
+      return { valida: true, sedute: insieme, nota: '' };
+    }
+
+    /* distanza in giorni fra ciascuna seduta e il periodo indicato */
+    var minimo = Infinity, vicine = [];
+    date.forEach(function (iso) {
+      var dist = Infinity;
+      an.intervalli.forEach(function (iv) {
+        var x = iso < iv.da ? giorniFra(iso, iv.da) : giorniFra(iv.a, iso);
+        if (x < dist) dist = x;
+      });
+      if (dist < minimo) { minimo = dist; vicine = [iso]; }
+      else if (dist === minimo) vicine.push(iso);
+    });
+    vicine.forEach(function (iso) { insieme[iso] = true; });
+    var rif = an.intervalli[0];
+    var descr = vicine.map(function (iso) {
+      return itData(iso) + ' (' + minimo + (minimo === 1 ? ' giorno ' : ' giorni ') + (iso < rif.da ? 'prima' : 'dopo') + ')';
+    });
+    var nota = 'Nessuna seduta ' + an.descrizione + '. ' +
+      (vicine.length > 1
+        ? 'Le sedute più vicine, alla stessa distanza, sono quelle del ' + descr.join(' e del ') + '.'
+        : 'La seduta più vicina è quella del ' + descr[0] + '.');
+    return { valida: true, sedute: insieme, nota: nota };
+  }
+
+  /* "10", "n. 10", "10/2025-26", "10 2025/26": numero ed eventuale anno
+     scolastico, quest'ultimo nella forma 2025-26 usata dall'indice. */
+  function analizzaNumero(testo) {
+    var n = (testo || '').trim();
+    if (!n) return null;
+    var m = /(\d{1,4})(?:\s*[\/\s-]\s*(\d{4})\s*[\/-]\s*(\d{2,4}))?/.exec(n);
+    if (!m) return { valido: false };
+    var anno = null;
+    if (m[2]) anno = m[2] + '-' + m[3].slice(-2);
+    return { valido: true, numero: parseInt(m[1], 10), anno: anno };
+  }
+
+  function annoNormalizzato(a) {
+    if (!a) return null;
+    var m = /(\d{4})\s*[\/-]\s*(\d{2,4})/.exec(String(a));
+    return m ? m[1] + '-' + m[2].slice(-2) : null;
+  }
+
+  function rigaFiltri(prefisso, etichettaNumero, segnapostoNumero, extra) {
+    return '<div class="filtri-elenco" id="filtri-' + prefisso + '">' +
+      '<label class="filtro-campo filtro-numero"><span>' + etichettaNumero + '</span>' +
+      '<input id="f-' + prefisso + '-numero" type="search" inputmode="text" autocomplete="off" placeholder="' + segnapostoNumero + '"></label>' +
+      '<label class="filtro-campo filtro-data"><span>Data del Consiglio</span>' +
+      '<input id="f-' + prefisso + '-data" type="search" autocomplete="off" placeholder="es. 23/04/2026 o aprile 2026"></label>' +
+      (extra || '') +
+      '<button class="bottone minuto" type="button" id="f-' + prefisso + '-azzera">Azzera</button>' +
+      '</div>' +
+      '<div class="nota-filtri" id="nota-' + prefisso + '" hidden></div>' +
+      '<div id="elenco-' + prefisso + '"></div>';
+  }
+
+  function agganciaFiltri(prefisso, campi, ridisegna) {
+    campi.forEach(function (c) {
+      var inp = el('f-' + prefisso + '-' + c);
+      if (inp) inp.addEventListener('input', ridisegna);
+    });
+    el('f-' + prefisso + '-azzera').addEventListener('click', function () {
+      campi.forEach(function (c) { var inp = el('f-' + prefisso + '-' + c); if (inp) inp.value = ''; });
+      ridisegna();
+    });
+  }
+
+  function mostraNota(prefisso, testi) {
+    var n = el('nota-' + prefisso);
+    var t = testi.filter(Boolean);
+    n.hidden = !t.length;
+    n.innerHTML = t.map(esc).join('<br>');
+  }
+
   function disegnaVerbali() {
-    var arr = ordinaDocs(docs(), 'recenti');
-    if (!arr.length) {
-      el('vista-verbali').innerHTML = '<div class="vuoto"><span class="grande">Archivio vuoto</span>' +
+    var vista = el('vista-verbali');
+    var tutti = ordinaDocs(docs(), 'recenti');
+    if (!tutti.length) {
+      vista.innerHTML = '<div class="vuoto"><span class="grande">Archivio vuoto</span>' +
         'Nessun verbale presente nell\'archivio.</div>';
       return;
     }
-    /* La tabella è la prima cosa sotto la barra delle schede: la nota che la
-       spiega viene dopo. */
+    if (!el('filtri-verbali')) {
+      vista.innerHTML = rigaFiltri('verbali', 'Numero del verbale', 'es. 10 o 10/2025-26');
+      agganciaFiltri('verbali', ['numero', 'data'], disegnaElencoVerbali);
+    }
+    disegnaElencoVerbali();
+  }
+
+  function disegnaElencoVerbali() {
+    var arr = ordinaDocs(docs(), 'recenti');
+    var note = [];
+    var num = analizzaNumero(el('f-verbali-numero').value);
+    if (num && !num.valido) note.push('Numero non riconosciuto: il filtro per numero non viene applicato.');
+    if (num && num.valido) {
+      arr = arr.filter(function (d) {
+        return d.numero === num.numero && (!num.anno || annoNormalizzato(d.annoScolastico) === num.anno);
+      });
+    }
+    var fd = filtroSedute(el('f-verbali-data').value);
+    if (fd) {
+      note.push(fd.nota);
+      if (fd.valida) arr = arr.filter(function (d) { return d.dataISO && fd.sedute[d.dataISO]; });
+    }
+    mostraNota('verbali', note);
+    stato._verbaliOrdinati = arr;
+    if (!arr.length) {
+      el('elenco-verbali').innerHTML = '<div class="vuoto"><span class="grande">Nessun verbale</span>' +
+        'Nessun verbale corrisponde ai filtri indicati.</div>';
+      return;
+    }
+    var filtrato = arr.length !== docs().length;
     var h = '';
     h += '<div class="tabella-contenitore"><table class="tabella-schede tabella-verbali"><thead><tr>' +
       '<th class="num">Verbale</th><th>Seduta</th><th class="num">Punti</th><th class="num">Delibere</th>' +
@@ -1217,10 +1356,10 @@
       h += '</td></tr>';
     });
     h += '</tbody></table></div>';
-    h += '<div class="riepilogo" style="margin-top:12px">' + arr.length +
+    h += '<div class="riepilogo" style="margin-top:12px">' +
+      (filtrato ? arr.length + ' di ' + docs().length : arr.length) +
       ' file nell\'archivio. Un clic sulla riga mostra i punti all\'ordine del giorno.</div>';
-    el('vista-verbali').innerHTML = h;
-    stato._verbaliOrdinati = arr;
+    el('elenco-verbali').innerHTML = h;
   }
 
   /* ------------------------------------------------------ vista delibere */
@@ -1238,6 +1377,7 @@
           });
           out.push({
             numero: num, ordn: parseInt(num, 10) || 0,
+            anno: annoNormalizzato(String(num).indexOf('/') >= 0 ? String(num).split('/').slice(1).join('/') : d.annoScolastico),
             verbale: d.numero, dataISO: d.dataISO, data: d.dataLabel,
             punto: s.punto, oggetto: s.titolo, nome: d.nome,
             sez: si, id: det ? det.id : null
@@ -1252,20 +1392,42 @@
     return out;
   }
 
-  function disegnaDelibere(filtro) {
-    var lista = elencoDelibere();
-    var f = P.norm(filtro || '');
-    if (f) {
+  function disegnaDelibere() {
+    var vista = el('vista-delibere');
+    if (!el('filtri-delibere')) {
+      vista.innerHTML = rigaFiltri('delibere', 'Numero della delibera', 'es. 96 o 96/2025-26',
+        '<label class="filtro-campo filtro-oggetto"><span>Oggetto</span>' +
+        '<input id="f-delibere-oggetto" type="search" autocomplete="off" placeholder="Parola dell\'oggetto"></label>');
+      agganciaFiltri('delibere', ['numero', 'data', 'oggetto'], disegnaElencoDelibere);
+    }
+    disegnaElencoDelibere();
+  }
+
+  function disegnaElencoDelibere() {
+    var tutte = elencoDelibere();
+    var lista = tutte, note = [];
+    var num = analizzaNumero(el('f-delibere-numero').value);
+    if (num && !num.valido) note.push('Numero non riconosciuto: il filtro per numero non viene applicato.');
+    if (num && num.valido) {
       lista = lista.filter(function (r) {
-        return P.norm(r.oggetto + ' ' + r.numero + ' ' + (r.data || '') + ' verbale ' + r.verbale).indexOf(f) >= 0;
+        return r.ordn === num.numero && (!num.anno || r.anno === num.anno);
       });
     }
-    var h = '<div class="filtro-tabella"><input id="filtro-delibere" type="search" placeholder="Filtra per oggetto o numero…" value="' + esc(filtro || '') + '">' +
-      '<span>' + lista.length + (lista.length === 1 ? ' delibera' : ' delibere') + '</span></div>';
+    var fd = filtroSedute(el('f-delibere-data').value);
+    if (fd) {
+      note.push(fd.nota);
+      if (fd.valida) lista = lista.filter(function (r) { return r.dataISO && fd.sedute[r.dataISO]; });
+    }
+    var f = P.norm(el('f-delibere-oggetto').value || '');
+    if (f) lista = lista.filter(function (r) { return P.norm(r.oggetto || '').indexOf(f) >= 0; });
+    mostraNota('delibere', note);
+
+    var h = '<div class="riepilogo" style="margin-bottom:8px">' +
+      (lista.length !== tutte.length ? lista.length + ' di ' + tutte.length : lista.length) +
+      (tutte.length === 1 ? ' delibera' : ' delibere') + '</div>';
     if (!lista.length) {
-      h += '<div class="vuoto"><span class="grande">Nessuna delibera</span>Non risultano delibere corrispondenti.</div>';
-      el('vista-delibere').innerHTML = h;
-      agganciaFiltroDelibere();
+      h += '<div class="vuoto"><span class="grande">Nessuna delibera</span>Non risultano delibere corrispondenti ai filtri indicati.</div>';
+      el('elenco-delibere').innerHTML = h;
       return;
     }
     h += '<div class="tabella-contenitore"><table class="tabella-schede tabella-delibere"><thead><tr>' +
@@ -1283,19 +1445,7 @@
         '</tr>';
     });
     h += '</tbody></table></div>';
-    el('vista-delibere').innerHTML = h;
-    agganciaFiltroDelibere();
-  }
-
-  function agganciaFiltroDelibere() {
-    var inp = el('filtro-delibere');
-    if (!inp) return;
-    inp.addEventListener('input', function () {
-      var pos = this.selectionStart, val = this.value;
-      disegnaDelibere(val);
-      var nuovo = el('filtro-delibere');
-      if (nuovo) { nuovo.focus(); try { nuovo.setSelectionRange(pos, pos); } catch (e) { } }
-    });
+    el('elenco-delibere').innerHTML = h;
   }
 
   function csvDelibere() {
@@ -2098,7 +2248,7 @@
     aggiornaStato();
     if (el('q').value.trim()) cerca(); else disegnaRisultati(null);
     disegnaVerbali();
-    disegnaDelibere(el('filtro-delibere') ? el('filtro-delibere').value : '');
+    disegnaDelibere();
     disegnaCestino();
     disegnaPresenze();
     disegnaCondivisione();
@@ -2900,7 +3050,8 @@
     if (!vista) return;
     aggiornaContatoreRaccolta();
 
-    var h = '';
+    /* La raccolta non ha una scheda propria: il titolo dice dove ci si trova. */
+    var h = '<h2 class="titolo-vista">Raccolta da condividere</h2>';
     /* L'intestazione del documento viene dopo l'elenco delle voci raccolte:
        sotto la barra delle schede sta ciò che la scheda contiene. */
     var intestazione = '<div class="riquadro" style="margin-top:14px"><h3>Documento da condividere</h3>' +
@@ -2920,7 +3071,7 @@
       h += '<div class="vuoto"><span class="grande">La raccolta è vuota</span>' +
         'Il comando <strong>Aggiungi alla raccolta</strong> compare accanto a ciascun risultato di ricerca, ' +
         'a ciascuna delibera, all\'ordine del giorno di ogni verbale e al prospetto delle presenze.<br>' +
-        'Gli elementi raccolti si ritrovano qui, in questa scheda, e vi restano anche dopo la chiusura del programma.</div>';
+        'Gli elementi raccolti si ritrovano qui, nella raccolta che si apre dal menu \u22ef, e vi restano anche dopo la chiusura del programma, ma soltanto su questo dispositivo.</div>';
       h += '<div class="azioni-punto"><button class="bottone minuto" data-aggiungi-nota="1">Aggiungi una nota libera</button>' +
         '<button class="bottone minuto" data-raccogli-presenze="1">Aggiungi il prospetto delle presenze</button></div>';
       vista.innerHTML = h;
@@ -3116,18 +3267,7 @@
 
     // schede
     Array.prototype.forEach.call(document.querySelectorAll('.scheda'), function (b) {
-      b.addEventListener('click', function () {
-        Array.prototype.forEach.call(document.querySelectorAll('.scheda'), function (x) { x.classList.remove('attiva'); });
-        b.classList.add('attiva');
-        ['risultati', 'verbali', 'delibere', 'presenze', 'condivisione', 'cestino', 'diagnostica'].forEach(function (v) {
-          el('vista-' + v).hidden = (v !== b.dataset.scheda);
-        });
-        /* I comandi di caricamento e di aggiornamento appartengono alla
-           gestione dell'archivio e compaiono soltanto nella scheda Verbali,
-           in testa all'elenco dei file. La testata ospita la sola barra
-           delle schede, oltre al menu delle altre azioni. */
-        el('azioni-verbali').hidden = (b.dataset.scheda !== 'verbali');
-      });
+      b.addEventListener('click', function () { mostraVista(b.dataset.scheda); });
     });
 
     // menu
@@ -3137,7 +3277,9 @@
     });
     document.addEventListener('click', function () { el('menu-altro').hidden = true; });
     el('menu-altro').addEventListener('click', function (e) {
-      var a = e.target.dataset.azione;
+      /* closest: il clic può cadere sul contatore contenuto nella voce */
+      var voce = e.target.closest ? e.target.closest('[data-azione]') : e.target;
+      var a = voce && voce.dataset ? voce.dataset.azione : null;
       if (!a) return;
       el('menu-altro').hidden = true;
       if (a === 'cerca') { apriRicerca(); return; }
@@ -3156,8 +3298,8 @@
       } else if (a === 'stampa-presenze') {
         stampaProspettoPresenze();
       } else if (a === 'raccolta') {
-        var sc = document.querySelector('.scheda[data-scheda="condivisione"]');
-        if (sc) { sc.click(); sc.scrollIntoView({ block: 'nearest' }); }
+        mostraVista('condivisione');
+        window.scrollTo({ top: 0, behavior: 'auto' });
       } else if (a === 'impostazioni') {
         if (window.ArchivioGitHub) window.ArchivioGitHub.impostazioni();
       }
@@ -3306,17 +3448,27 @@
     valuta();
   }
 
-  /* Il riquadro di ricerca sta chiuso e si apre dal menu delle azioni,
-     oppure con Ctrl+F. Aprendolo si passa alla scheda dei risultati, perché è
-     là che la ricerca si legge. */
-  function apriRicerca(forza) {
-    var r = el('pannello-ricerca');
-    if (!r) return;
-    var apri = forza === true ? true : r.hidden;
-    r.hidden = !apri;
-    if (!apri) return;
-    var t = document.querySelector('.scheda[data-scheda="risultati"]');
-    if (t && !t.classList.contains('attiva')) t.click();
+  /* Mostra una vista. Le viste corrispondono alle schede, salvo la raccolta
+     da condividere, che si apre dal menu ⋯ e non ha una scheda propria:
+     mentre è aperta nessuna scheda risulta attiva. Il riquadro di ricerca
+     appartiene alla scheda Cerca (identificativo interno «risultati») e
+     compare soltanto in essa; i comandi di caricamento e di aggiornamento
+     appartengono alla scheda Verbali. */
+  function mostraVista(nome) {
+    Array.prototype.forEach.call(document.querySelectorAll('.scheda'), function (x) {
+      x.classList.toggle('attiva', x.dataset.scheda === nome);
+    });
+    ['risultati', 'verbali', 'delibere', 'presenze', 'condivisione', 'cestino', 'diagnostica'].forEach(function (v) {
+      el('vista-' + v).hidden = (v !== nome);
+    });
+    el('pannello-ricerca').hidden = (nome !== 'risultati');
+    el('azioni-verbali').hidden = (nome !== 'verbali');
+  }
+
+  /* Con Ctrl+F, o con i comandi che rimandano alla ricerca, si passa alla
+     scheda Cerca e si porta il cursore nel campo. */
+  function apriRicerca() {
+    mostraVista('risultati');
     window.scrollTo({ top: 0, behavior: 'auto' });
     var q = el('q');
     if (q) { q.focus(); q.select(); }
