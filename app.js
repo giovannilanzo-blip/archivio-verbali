@@ -1178,18 +1178,18 @@
     /* La tabella è la prima cosa sotto la barra delle schede: la nota che la
        spiega viene dopo. */
     var h = '';
-    h += '<div class="tabella-contenitore"><table><thead><tr>' +
+    h += '<div class="tabella-contenitore"><table class="tabella-schede tabella-verbali"><thead><tr>' +
       '<th class="num">Verbale</th><th>Seduta</th><th class="num">Punti</th><th class="num">Delibere</th>' +
       '<th>Delibere adottate</th><th>File</th></tr></thead><tbody>';
     arr.forEach(function (d, i) {
       var punti = d.sezioni.filter(function (s) { return s.punto; }).length;
       h += '<tr class="riga-espandi" data-riga="' + i + '">' +
-        '<td class="num">' + (d.numero != null ? esc(d.numero) : '—') + (d.annoScolastico ? '<span style="color:var(--testo-debole)">/' + esc(d.annoScolastico) + '</span>' : '') + '</td>' +
-        '<td>' + esc(d.dataLabel || '—') + '</td>' +
-        '<td class="num">' + punti + '</td>' +
-        '<td class="num">' + (d.delibere || []).length + '</td>' +
-        '<td class="mono">' + esc((d.delibere || []).join(', ') || '—') + '</td>' +
-        '<td class="mono">' + esc(d.nome) + (d.errore ? ' <span style="color:var(--allerta)">· non indicizzato</span>' : '') + '</td>' +
+        '<td class="num c-numero">' + (d.numero != null ? esc(d.numero) : '—') + (d.annoScolastico ? '<span style="color:var(--testo-debole)">/' + esc(d.annoScolastico) + '</span>' : '') + '</td>' +
+        '<td class="c-data">' + esc(d.dataLabel || '—') + '</td>' +
+        '<td class="num c-punti" data-etichetta="punti">' + punti + '</td>' +
+        '<td class="num c-delibere" data-etichetta="delibere">' + (d.delibere || []).length + '</td>' +
+        '<td class="mono c-elenco" data-etichetta="Delibere adottate">' + esc((d.delibere || []).join(', ') || '—') + '</td>' +
+        '<td class="mono c-file">' + esc(d.nome) + (d.errore ? ' <span style="color:var(--allerta)">· non indicizzato</span>' : '') + '</td>' +
         '</tr>';
       h += '<tr class="dettaglio-verbale" data-dettaglio="' + i + '" hidden><td colspan="6">';
       if (d.errore) {
@@ -1268,15 +1268,15 @@
       agganciaFiltroDelibere();
       return;
     }
-    h += '<div class="tabella-contenitore"><table><thead><tr>' +
+    h += '<div class="tabella-contenitore"><table class="tabella-schede tabella-delibere"><thead><tr>' +
       '<th class="num">Delibera</th><th class="num">Verbale</th><th>Seduta</th><th class="num">Punto</th><th>Oggetto</th></tr></thead><tbody>';
     lista.forEach(function (r) {
       h += '<tr>' +
-        '<td class="num"><strong>' + esc(r.numero) + '</strong></td>' +
-        '<td class="num">' + (r.verbale != null ? 'n. ' + esc(r.verbale) : '—') + '</td>' +
-        '<td>' + esc(r.data || '—') + '</td>' +
-        '<td class="num">' + esc(r.punto || '—') + '</td>' +
-        '<td>' + esc(r.oggetto) +
+        '<td class="num c-numero" data-etichetta="Delibera"><strong>' + esc(r.numero) + '</strong></td>' +
+        '<td class="num c-verbale" data-etichetta="verbale">' + (r.verbale != null ? 'n. ' + esc(r.verbale) : '—') + '</td>' +
+        '<td class="c-data">' + esc(r.data || '—') + '</td>' +
+        '<td class="num c-punto" data-etichetta="punto">' + esc(r.punto || '—') + '</td>' +
+        '<td class="c-oggetto">' + esc(r.oggetto) +
         (r.id ? ' <button class="bottone minuto" data-raccogli-delibera="' + esc(r.nome) +
           '" data-sez="' + r.sez + '" data-delibera="' + esc(r.id) + '">raccogli</button>' : '') +
         ' <button class="bottone minuto" data-apri="' + esc(r.nome) + '">apri</button></td>' +
