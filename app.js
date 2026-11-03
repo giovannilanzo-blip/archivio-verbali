@@ -278,6 +278,7 @@
     if (!s.decadenze) s.decadenze = {};
     if (!s.silenziati) s.silenziati = {};
     if (!s.cessati) s.cessati = {};
+    if (!s.insediati) s.insediati = {};
     if (!s.esclusi) s.esclusi = [];
     if (!s.esclusiInizializzati) {
       ESCLUSI_PREDEFINITI.forEach(function (e) {
@@ -417,6 +418,16 @@
       }
     });
 
+    /* Componenti insediati (dati/presenze.json, voce insediati): figurano fra
+       quelli in carica anche prima che un verbale archiviato li riporti nella
+       tabella delle presenze. */
+    var insediati = statoPresenze().insediati || {};
+    Object.keys(insediati).forEach(function (k) {
+      var ins = insediati[k] || {};
+      var m = registra(ins.nome || k);
+      if (m && ins.ruolo && !m.ruolo) m.ruolo = ins.ruolo;
+    });
+
     var ultima = conTabella.length ? conTabella[conTabella.length - 1] : null;
 
     var elenco = Object.keys(membri).map(function (k) { return membri[k]; });
@@ -451,7 +462,12 @@
       m.sedutaRosso = sedutaRosso;
       m.serieRossa = serieRossa;
       m.cessato = statoPresenze().cessati[m.chiave] || null;
-      m.inCarica = m.cessato ? false : (ultima ? statoIn(ultima, m.chiave) !== null : false);
+      var ins = insediati[m.chiave];
+      m.inCarica = m.cessato ? false : (
+        (ultima ? statoIn(ultima, m.chiave) !== null : false) ||
+        // insediato dopo l'ultima seduta archiviata: è in carica, anche se
+        // nessuna tabella lo riporta ancora
+        !!(ins && (!ultima || !ultima.dataISO || !ins.data || ultima.dataISO < ins.data)));
       m.decadenza = statoPresenze().decadenze[m.chiave] || null;
       m.silenziato = !!statoPresenze().silenziati[m.chiave];
 
