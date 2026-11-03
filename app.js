@@ -1751,10 +1751,15 @@
       h += '</div>';
     }
 
-    var esclusi = statoPresenze().esclusi || [];
+    /* Gli esclusi in modo permanente (permanente: true in dati/presenze.json)
+       restano fuori dal monitoraggio ma non compaiono più in questo elenco e
+       non si possono reintegrare. L'indice resta quello dell'elenco completo. */
+    var esclusi = (statoPresenze().esclusi || []).map(function (e, i) { return { e: e, i: i }; })
+      .filter(function (x) { return !x.e.permanente; });
     if (esclusi.length) {
       h += '<div class="riquadro-esclusi"><strong>Esclusi dal monitoraggio delle presenze:</strong> ';
-      h += esclusi.map(function (e, i) {
+      h += esclusi.map(function (x) {
+        var e = x.e, i = x.i;
         return '<span class="voce-esclusa">' + esc(e.etichetta || e.pattern) +
           '<button class="bottone minuto" data-reintegra="' + i + '" title="Riporta il nominativo nel monitoraggio">reintegra</button></span>';
       }).join(' ');
@@ -2067,7 +2072,7 @@
   function reintegraEscluso(indice) {
     var s = statoPresenze();
     var e = s.esclusi[indice];
-    if (!e) return;
+    if (!e || e.permanente) return;
     if (!confirm('Riportare «' + (e.etichetta || e.pattern) + '» nel monitoraggio delle presenze?')) return;
     s.esclusi.splice(indice, 1);
     salvaPresenze().then(function () { disegnaPresenze(); });
