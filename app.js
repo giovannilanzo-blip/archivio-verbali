@@ -279,6 +279,7 @@
     if (!s.silenziati) s.silenziati = {};
     if (!s.cessati) s.cessati = {};
     if (!s.insediati) s.insediati = {};
+    if (!s.ripartenze) s.ripartenze = {};
     if (!s.esclusi) s.esclusi = [];
     if (!s.esclusiInizializzati) {
       ESCLUSI_PREDEFINITI.forEach(function (e) {
@@ -371,6 +372,12 @@
        verbali documentano. */
     var cess = statoPresenze().cessati[chiave];
     if (cess && cess.data && doc.dataISO && doc.dataISO >= cess.data) return null;
+
+    /* Ripartenza del conteggio (per esempio dopo una rielezione): le sedute
+       anteriori alla data non contano più; il loro dato resta archiviato in
+       dati/presenze.json, voce ripartenze, e nel file indicato lì. */
+    var rip = statoPresenze().ripartenze[chiave];
+    if (rip && rip.data && doc.dataISO && doc.dataISO < rip.data) return null;
 
     var corr = statoPresenze().correzioni[doc.nome + '||' + chiave];
     if (corr) return corr === 'assente' ? 'assente' : (corr === 'presente' ? 'presente' : null);
